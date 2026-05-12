@@ -9,8 +9,9 @@ CointegrationFilter
                       at most one ADF call per pair per day.
 
 MacroFilter
-    is_entry_blocked: VIX9D backwardation (macro_alert) OR K-Means != Sideways
-    is_force_close:   K-Means Panic (regime 2)  OR  global SPY HMM panic
+    is_entry_blocked: VIX9D backwardation (macro_alert) OR
+                      K-Means != Sideways OR global SPY HMM panic
+    is_force_close:   K-Means Panic (regime 2)
     force_close_reason: label written to trade record
 """
 
@@ -118,10 +119,10 @@ class MacroFilter:
     Entry blocking (is_entry_blocked):
         — VIX9D > VIX (backwardation) from iv.py  → macro_alert_s
         — K-Means regime != 1 (Sideways)           → kmeans_series
+        — Global SPY HMM panic                    → global_hmm_s
 
     Force-close (is_force_close):
         — K-Means regime == 2 (Panic)
-        — Global SPY HMM panic                     → global_hmm_s
 
     All three input Series are optional; missing → conservative default
     (no block, no force-close).
@@ -155,14 +156,14 @@ class MacroFilter:
             return True
         if self._km and self._km.get(d, 1) != 1:  # K-Means: only Sideways=1 allowed
             return True
+        if self._hmm.get(d, 0) == 1:           # global SPY HMM panic
+            return True
         return False
 
     def is_force_close(self, ts) -> bool:
         """True → immediately close any open position on this bar."""
         d = _to_date(ts)
         if self._km.get(d, 1) == 2:   # K-Means Panic
-            return True
-        if self._hmm.get(d, 0) == 1:  # global SPY HMM panic (new)
             return True
         return False
 
@@ -171,8 +172,6 @@ class MacroFilter:
         d = _to_date(ts)
         if self._km.get(d, 1) == 2:
             return "PANIC"
-        if self._hmm.get(d, 0) == 1:
-            return "HMM_PANIC"
         return "FORCE_CLOSE"
 
 

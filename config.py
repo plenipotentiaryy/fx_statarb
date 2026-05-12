@@ -195,6 +195,11 @@ WFO_MIN_TRADES   = 5    # minimum trades per OOS window to count as valid
 WFO_EXPANDING    = False # True = expanding window (train_start anchored to data origin)
                          # False = rolling window (classic Gatev fixed-width train)
 
+ZERO_ROLLING_WINDOW_DAYS   = 60
+ZERO_MIN_PROFIT_DAYS_30D   = 7
+ZERO_MIN_PROFIT_DAYS_60D   = 14
+ZERO_MIN_PROFIT_DAY_PCT    = 0.0025
+
 PAIR_MAX_LOSS = -1500.0   # disable pair if cumulative net P&L drops below this (= -30 × 50 leverage)
 
 IV_LOOKBACK   = 60         # days for IV percentile calculation
@@ -212,10 +217,11 @@ MIN_POSITION_SIZE    = 0.15  # skip trade entirely if combined size below this
 
 INITIAL_CAPITAL = 5_000         # FundingPips Zero account size in USD
 LEVERAGE        = 50            # 1:50 leverage — max notional = INITIAL_CAPITAL × LEVERAGE
-ALLOCATION_METHOD = "markowitz"    # "equal" | "sharpe" | "markowitz" (MVO)
+ALLOCATION_METHOD = "equal"       # "equal" | "sharpe" | "markowitz" (MVO)
 MAX_PAIR_WEIGHT   = 0.15        # cap: no single pair gets more than 15% of capital
 
 TARGET_RISK_USD = 150.0              # dollar risk per trade (1σ of spread) — leverage in cap_n only
+ENTRY_COST_SAFETY = 3.0              # expected gross edge must cover costs by this multiple
 
 # ── FundingPips Zero profile ────────────────────────────────────────────────
 # Zero account is pre-passed, funded at $5k, with live-account style risk rules.
@@ -224,8 +230,6 @@ ACCOUNT_MODEL    = "Zero"
 ACCOUNT_SIZE     = 5_000
 ZERO_MAX_TRAILING_LOSS_PCT = 0.05   # 5% trailing loss until 5% profit, then locked at initial balance
 ZERO_MAX_DAILY_LOSS_PCT    = 0.03   # 3% daily loss limit
-ZERO_MIN_PROFIT_DAYS_30D   = 7
-ZERO_MIN_PROFIT_DAY_PCT     = 0.0025
 ZERO_MAX_INACTIVE_DAYS      = 30
 ZERO_AVOID_NEWS_TRADING     = True
 

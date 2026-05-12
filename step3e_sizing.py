@@ -6,7 +6,7 @@ from config import (
     REGIME_MULT_NORMAL, REGIME_MULT_VOLATILE, HMM_PANIC_MULT,
     IV_MULT_MAX, IV_MULT_MIN, IV_LOOKBACK,
     MIN_POSITION_SIZE,
-    DATA_DIR, OUTPUT_DIR,
+    DATA_DIR, OUTPUT_DIR, NON_FX_TICKERS,
 )
 
 # ── Load all sources ──────────────────────────────────────────────────────────
@@ -91,7 +91,7 @@ def global_hmm_multiplier(global_hmm: pd.Series | None, date) -> float:
     key = pd.Timestamp(date).normalize().tz_localize("UTC")
     try:
         val = global_hmm.asof(key)
-        return HMM_PANIC_MULT if (not pd.isna(val) and int(val) == 1) else 1.0
+        return 0.0 if (not pd.isna(val) and int(val) == 1) else 1.0
     except Exception:
         return 1.0
 
@@ -108,6 +108,11 @@ def macro_alert_active(macro_alert: pd.Series | None, date) -> bool:
 
 def mc_confidence(mc_conf: dict, pair: str) -> float:
     return mc_conf.get(pair, 1.0)
+
+
+def _is_fx_pair(pair: str) -> bool:
+    legs = [leg.strip().lower() for leg in str(pair).split("-") if leg.strip()]
+    return len(legs) == 2 and all(leg not in NON_FX_TICKERS for leg in legs)
 
 
 def position_size(pair: str, ts, regimes, iv_mult_s, mc_conf: dict,
@@ -133,6 +138,7 @@ mc_conf        = load_mc_confidence()
 iv_mult_s      = iv_multiplier_series(vix)
 
 pairs = pd.read_csv(DATA_DIR / "pairs_selected.csv")
+pairs = pairs[pairs["pair"].map(_is_fx_pair)].reset_index(drop=True)
 pair_names = list(pairs["pair"])
 
 # ── Build position size grid ──────────────────────────────────────────────────

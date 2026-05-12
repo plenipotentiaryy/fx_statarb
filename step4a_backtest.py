@@ -11,10 +11,11 @@ from config import (
     IV_SIZE_NORM, MIN_POSITION_SIZE, TRAIN_RATIO,
     RTH_START, RTH_END, SIGNAL_START, RECENT_BARS,
     DATA_DIR, OUTPUT_DIR, INITIAL_CAPITAL, LEVERAGE,
-    ACCOUNT_MODEL,
+    ACCOUNT_MODEL, NON_FX_TICKERS,
     ALLOCATION_METHOD, MAX_PAIR_WEIGHT, TARGET_RISK_USD,
     ZERO_MAX_TRAILING_LOSS_PCT, ZERO_MAX_DAILY_LOSS_PCT,
-    ZERO_MIN_PROFIT_DAYS_30D,
+    ZERO_MIN_PROFIT_DAYS_30D, ZERO_MIN_PROFIT_DAYS_60D,
+    ZERO_ROLLING_WINDOW_DAYS, ENTRY_COST_SAFETY,
     ZERO_MAX_INACTIVE_DAYS,
     BARS_PER_DAY, CLOSES_FILE, KALMAN_DELTA,
     COINT_WINDOW_DAYS, COINT_BREAK_P, COINT_RECHECK_DAYS,
@@ -54,6 +55,11 @@ def _pairs_universe_path() -> str:
     return str(DATA_DIR / "pairs_selected.csv")
 
 
+def _is_fx_pair(pair: str) -> bool:
+    legs = [leg.strip().lower() for leg in str(pair).split("-") if leg.strip()]
+    return len(legs) == 2 and all(leg not in NON_FX_TICKERS for leg in legs)
+
+
 def _data_path() -> str:
     p = DATA_DIR / CLOSES_FILE
     if not p.exists():
@@ -76,7 +82,9 @@ def load_closes() -> pd.DataFrame:
     if pairs_path.exists():
         meta = pd.read_csv(pairs_path)
         if not meta.empty:
-            tickers = sorted({t for p in meta["pair"] for t in str(p).split("-")})
+            meta = meta[meta["pair"].map(_is_fx_pair)]
+            if not meta.empty:
+                tickers = sorted({t for p in meta["pair"] for t in str(p).split("-")})
 
     try:
         from data_loader import load_closes as _load_closes
@@ -99,6 +107,7 @@ def load_closes() -> pd.DataFrame:
     if pairs_path.exists():
         meta = pd.read_csv(pairs_path)
         if not meta.empty:
+            meta = meta[meta["pair"].map(_is_fx_pair)]
             needed    = {t for p in meta["pair"] for t in p.split("-")}
             available = [t for t in needed if t in closes.columns]
             closes    = closes[available].dropna()
@@ -300,7 +309,7 @@ def load_kmeans_regime() -> pd.Series | None:
 
 
 def min_viable_entry_z(sigma_spread: float, avg_notional: float,
-                        exit_z: float, safety: float = 2.5) -> float:
+                        exit_z: float, safety: float = ENTRY_COST_SAFETY) -> float:
     """
     Minimum entry Z-score for expected gross P&L to exceed transaction costs.
 
@@ -309,7 +318,7 @@ def min_viable_entry_z(sigma_spread: float, avg_notional: float,
         (entry_z + |exit_z|) × sigma >= safety × 2 × COST_MAKER, COST_TAKER, CIRCUIT_BREAKER_Z × notional
         → entry_z_min = safety × cost_fraction − |exit_z|
 
-    safety=2.5 means expected profit must be 2.5× the transaction cost.
+    safety=3.0 means expected profit must be 3× the transaction cost.
     If the grid/MC optimised entry_z is below this floor, we raise it.
     """
     cost_frac = (2 * COST_TAKER * avg_notional) / max(sigma_spread, 1e-8)
@@ -404,7 +413,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
     coint_filter : CointegrationFilter — O(1) daily coint validity + lazy ADF
                    on Z-trigger. Force-closes and suspends when coint breaks.
     macro_filter : MacroFilter — entry blocking (VIX9D / K-Means) and
-                   force-close (K-Means Panic / global HMM panic).
+                   force-close (K-Means Panic only; HMM panic blocks entries).
     """
     t1_col, t2_col = f"{t1}_close", f"{t2}_close"
     position       = 0
@@ -465,7 +474,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
             else:
                 suspended = True  # Block pair permanently for this window
         else:
-            # ── Macro force-close (K-Means Panic or global HMM panic) ────────
+            # ── Macro force-close (K-Means Panic only) ────────────────────────
             force_close = (
                 suspended
                 or (macro_filter is not None and macro_filter.is_force_close(ts))
@@ -785,6 +794,9 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
 closes = load_closes()
 pairs_path = Path(_pairs_universe_path())
 pairs  = pd.read_csv(pairs_path)
+pairs  = pairs[pairs["pair"].map(_is_fx_pair)].reset_index(drop=True)
+if pairs.empty:
+    raise SystemExit("No FX pairs available after commodity filter.")
 needed_tickers = sorted({t for p in pairs["pair"] for t in str(p).split("-")})
 
 # Load volumes for VW-Z and VWAP prices (both optional — fallback to close/equal-weight)
@@ -1031,6 +1043,16 @@ def compute_pair_weights(pairs_df: pd.DataFrame,
     return weights
 
 
+def _rolling_window_activity(daily_pnl: pd.Series, window_days: int) -> tuple[int, int, float]:
+    trade_days = (daily_pnl != 0).rolling(window_days, min_periods=window_days).sum()
+    profit_days = (daily_pnl > 0).rolling(window_days, min_periods=window_days).sum()
+    pnl_window = daily_pnl.rolling(window_days, min_periods=window_days).sum()
+    trade_max = int(trade_days.max()) if pd.notna(trade_days.max()) else 0
+    profit_max = int(profit_days.max()) if pd.notna(profit_days.max()) else 0
+    pnl_max = float(pnl_window.max()) if pd.notna(pnl_window.max()) else 0.0
+    return trade_max, profit_max, pnl_max
+
+
 def zero_account_report(df_trades: pd.DataFrame,
                         initial_capital: float) -> dict[str, object]:
     """Approximate FundingPips Zero compliance from realized trade exits."""
@@ -1043,6 +1065,9 @@ def zero_account_report(df_trades: pd.DataFrame,
             "max_trade_days_30d": 0,
             "max_profit_days_30d": 0,
             "max_30d_pnl": 0.0,
+            "max_trade_days_60d": 0,
+            "max_profit_days_60d": 0,
+            "max_60d_pnl": 0.0,
         }
 
     trades = df_trades.copy()
@@ -1083,16 +1108,8 @@ def zero_account_report(df_trades: pd.DataFrame,
 
         prev_day = day
 
-    trade_day = daily_pnl != 0
-    profit_day = daily_pnl > 0
-    rolling_trade_days = trade_day.rolling(30, min_periods=30).sum()
-    rolling_profit_days = profit_day.rolling(30, min_periods=30).sum()
-    trade_max = rolling_trade_days.max()
-    profit_max = rolling_profit_days.max()
-    pnl_max = daily_pnl.rolling(30, min_periods=30).sum().max()
-    max_trade_days_30d = int(trade_max) if pd.notna(trade_max) else 0
-    max_profit_days_30d = int(profit_max) if pd.notna(profit_max) else 0
-    max_30d_pnl = float(pnl_max) if pd.notna(pnl_max) else 0.0
+    max_trade_days_30d, max_profit_days_30d, max_30d_pnl = _rolling_window_activity(daily_pnl, 30)
+    max_trade_days_60d, max_profit_days_60d, max_60d_pnl = _rolling_window_activity(daily_pnl, ZERO_ROLLING_WINDOW_DAYS)
 
     trade_days = trades["trade_day"].drop_duplicates().sort_values()
     inactive_days = None
@@ -1110,14 +1127,77 @@ def zero_account_report(df_trades: pd.DataFrame,
         "max_trade_days_30d": int(max_trade_days_30d),
         "max_profit_days_30d": int(max_profit_days_30d),
         "max_30d_pnl": round(max_30d_pnl, 4),
+        "max_trade_days_60d": int(max_trade_days_60d),
+        "max_profit_days_60d": int(max_profit_days_60d),
+        "max_60d_pnl": round(max_60d_pnl, 4),
     }
 
 
+def apply_zero_hard_constraints(df_trades: pd.DataFrame,
+                                initial_capital: float) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Trim the trade stream after the first realized Zero rule breach."""
+    if df_trades.empty:
+        return df_trades.copy(), {"breach": None, "breached": False}
+
+    trades = df_trades.copy()
+    trades["exit_time"] = pd.to_datetime(trades["exit_time"], utc=True).dt.tz_convert("US/Eastern")
+    trades = trades.sort_values("exit_time")
+
+    kept = []
+    current_equity = initial_capital
+    peak_equity = initial_capital
+    prev_day = None
+    day_start_equity = initial_capital
+    breach_reason = None
+
+    for idx, row in trades.iterrows():
+        day = row["exit_time"].normalize()
+        if prev_day is None or day != prev_day:
+            day_start_equity = current_equity
+
+        pnl = float(row.get("dollar_pnl", row.get("net_pnl", 0.0)))
+        current_equity += pnl
+        peak_equity = max(peak_equity, current_equity)
+
+        kept.append(idx)
+        prev_day = day
+
+        daily_floor = day_start_equity * (1 - ZERO_MAX_DAILY_LOSS_PCT)
+        if current_equity < daily_floor:
+            breach_reason = "daily_loss"
+            break
+
+        if peak_equity < initial_capital * 1.05:
+            trailing_floor = peak_equity - initial_capital * ZERO_MAX_TRAILING_LOSS_PCT
+        else:
+            trailing_floor = initial_capital
+        if current_equity < trailing_floor:
+            breach_reason = "trailing_loss"
+            break
+
+    filtered = trades.loc[kept].copy()
+    filtered.attrs["zero_hard_stop"] = breach_reason
+    filtered.attrs["zero_hard_breached"] = breach_reason is not None
+    return filtered, {"breach": breach_reason, "breached": breach_reason is not None}
+
+
 def zero_universe_ok(zero: dict[str, object]) -> bool:
-    """Universe curation gate for Zero profile."""
+    """Universe curation gate for Zero profile.
+
+    Uses both the prop rules (30d) and a longer 60d stability window.
+    """
     return (
-        int(zero.get("max_trade_days_30d", 0)) >= ZERO_MIN_PROFIT_DAYS_30D
+        not bool(zero.get("trailing_loss_breached", False))
+        and not bool(zero.get("daily_loss_breached", False))
+        and (
+            zero.get("max_inactive_days") is None
+            or int(zero.get("max_inactive_days", 0)) <= ZERO_MAX_INACTIVE_DAYS
+        )
+        and int(zero.get("max_trade_days_30d", 0)) >= ZERO_MIN_PROFIT_DAYS_30D
         and int(zero.get("max_profit_days_30d", 0)) >= ZERO_MIN_PROFIT_DAYS_30D
+        and int(zero.get("max_trade_days_60d", 0)) >= ZERO_MIN_PROFIT_DAYS_60D
+        and int(zero.get("max_profit_days_60d", 0)) >= ZERO_MIN_PROFIT_DAYS_60D
+        and float(zero.get("max_60d_pnl", 0.0)) > 0.0
     )
 
 _pair_weights = compute_pair_weights(pairs, _opt_path)
@@ -1279,13 +1359,18 @@ for _, row in pairs.iterrows():
         "max_trade_days_30d": int(zero["max_trade_days_30d"]),
         "max_profit_days_30d": int(zero["max_profit_days_30d"]),
         "max_30d_pnl": float(zero["max_30d_pnl"]),
+        "max_trade_days_60d": int(zero["max_trade_days_60d"]),
+        "max_profit_days_60d": int(zero["max_profit_days_60d"]),
+        "max_60d_pnl": float(zero["max_60d_pnl"]),
         "max_inactive_days": zero["max_inactive_days"],
+        "hard_zero_breach": trades.attrs.get("zero_hard_stop"),
         "zero_universe_ok": bool(zero_ok),
     })
 
     if ACCOUNT_MODEL == "Zero" and not zero_ok:
         print(f"  SKIP {row['pair']}: Zero universe filter "
-              f"(trade30={zero['max_trade_days_30d']}, profit30={zero['max_profit_days_30d']}, "
+              f"(trade60={zero['max_trade_days_60d']}, profit60={zero['max_profit_days_60d']}, "
+              f"trade30={zero['max_trade_days_30d']}, profit30={zero['max_profit_days_30d']}, "
               f"gap={zero['max_inactive_days']})")
         continue
 
@@ -1303,13 +1388,14 @@ if ACCOUNT_MODEL == "Zero":
             "pair", "t1", "t2", "corr", "beta", "hurst", "half_life_bars",
             "joh_trace", "joh_crit_95", "joh_margin", "net_pnl", "trades",
             "win_rate", "max_trade_days_30d", "max_profit_days_30d",
-            "max_30d_pnl", "max_inactive_days",
+            "max_30d_pnl", "max_trade_days_60d", "max_profit_days_60d",
+            "max_60d_pnl", "max_inactive_days", "hard_zero_breach",
     ] if c in (zero_df.columns if not zero_df.empty else zero_universe_rows[0].keys() if zero_universe_rows else [])]
     if zero_df.empty:
         pd.DataFrame(columns=zero_cols).to_csv(zero_path, index=False)
         print(f"\nZero universe saved: 0 pairs -> {zero_path}")
     else:
-        zero_df = zero_df[zero_cols].sort_values(["net_pnl", "max_30d_pnl"], ascending=False)
+        zero_df = zero_df[zero_cols].sort_values(["max_60d_pnl", "net_pnl"], ascending=False)
         zero_df.to_csv(zero_path, index=False)
         print(f"\nZero universe saved: {len(zero_df)} pairs -> {zero_path}")
 
@@ -1320,6 +1406,12 @@ if not pair_results:
 df_trades = (pd.concat([v["trades"] for v in pair_results.values()])
                .sort_values("exit_time")
                .reset_index(drop=True))
+
+if ACCOUNT_MODEL == "Zero":
+    df_trades, zero_hard = apply_zero_hard_constraints(df_trades, INITIAL_CAPITAL)
+    if zero_hard.get("breached"):
+        print(f"\nZero hard stop triggered: {zero_hard.get('breach')} — trimming later trades")
+    # Refresh the saved trade stream and portfolio summary from the truncated history.
 
 pnl             = df_trades["net_pnl"]
 winning         = df_trades[pnl > 0]
@@ -1381,6 +1473,11 @@ print(f"30d trade days:     max {zero['max_trade_days_30d']} in any 30d window "
       f"(need {ZERO_MIN_PROFIT_DAYS_30D})")
 print(f"30d profit days:    max {zero['max_profit_days_30d']} in any 30d window "
       f"(need {ZERO_MIN_PROFIT_DAYS_30D})")
+print(f"60d trade days:     max {zero['max_trade_days_60d']} in any 60d window "
+      f"(need {ZERO_MIN_PROFIT_DAYS_60D})")
+print(f"60d profit days:    max {zero['max_profit_days_60d']} in any 60d window "
+      f"(need {ZERO_MIN_PROFIT_DAYS_60D})")
+print(f"60d net P&L:        ${zero['max_60d_pnl']:,.2f}")
 if zero["max_inactive_days"] is not None:
     print(f"Max inactivity gap: {zero['max_inactive_days']} days "
           f"(limit {ZERO_MAX_INACTIVE_DAYS})")
