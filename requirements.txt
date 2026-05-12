@@ -1,0 +1,12 @@
+hmmlearn
+matplotlib
+numpy
+pandas
+polygon
+pyarrow
+python-dotenv
+scikit-learn
+scipy
+seaborn
+statsmodels
+yfinance
