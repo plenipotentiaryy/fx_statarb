@@ -12,13 +12,13 @@ import statsmodels.api as sm
 from config import DATA_DIR, COINT_WINDOW_DAYS, TICKERS, SSD_PERCENTILE, NON_FX_TICKERS, BARS_PER_DAY
 
 # ── Tunable parameters ────────────────────────────────────────────────────────
-CORR_MIN      = 0.40
+CORR_MIN      = 0.25
 JOH_CRIT      = 0.95
 BETA_MIN      = 0.10
 BETA_MAX      = 15.0
-HURST_MAX     = 0.45   # tightened: H must be clearly mean-reverting
+HURST_MAX     = 0.48   # consistent with config.py while still slightly stricter
 MIN_OBS       = 252
-HALF_LIFE_MAX = 1440   # bars on intraday tf — max 1 trading day at 1-min (= 1 day at 15-min: 96)
+HALF_LIFE_MAX_DAYS = 30   # max daily half-life in calendar days
 
 # Pairs that failed systematic backtesting (near-zero WR regardless of parameters)
 BLACKLIST = {
@@ -115,13 +115,17 @@ def main():
         pc = recent[[t1, t2]].dropna()
         try:
             trace, crit, beta = _johansen_beta(pc)
-            if trace > crit and BETA_MIN <= abs(beta) <= BETA_MAX and beta > 0:
+            # Negative betas are valid for FX crosses with inverted quote
+            # conventions; downstream sizing/backtest already handles abs(beta).
+            if trace > crit and BETA_MIN <= abs(beta) <= BETA_MAX:
                 spread = pc[t1] - beta * pc[t2]
                 hurst = hurst_exponent(spread.values)
                 if hurst < HURST_MAX:
                     hl = compute_half_life(spread)
-                    hl_bars = round(hl * BARS_PER_DAY, 0)   # correct for any bar size
-                    if hl_bars > HALF_LIFE_MAX or hl_bars <= 0:
+                    # Half-life here is computed on daily data, so validate in days
+                    # and only convert to intraday bars for downstream storage.
+                    hl_bars = round(hl * BARS_PER_DAY, 1)
+                    if hl <= 0 or hl > HALF_LIFE_MAX_DAYS:
                         continue
                     results.append({
                         "pair": f"{t1}-{t2}",

@@ -28,6 +28,7 @@ from config import (
     RCDP_ENTRY_GRID, RCDP_EXIT_GRID, RCDP_STOP_GRID,
     RCDP_MIN_TRADES_VOLATILE,
 )
+from utils import fast_read
 
 # Minimum trades for normal-regime slice (same as grid.py)
 MIN_TRADES_NORMAL = 8
@@ -200,7 +201,7 @@ def load_data():
     path = DATA_DIR / CLOSES_FILE
     if not path.exists():
         path = DATA_DIR / "closes_15min.csv"
-    closes = pd.read_csv(path, index_col=0, parse_dates=True)
+    closes = fast_read(path, log_label=path.name)
     closes.index = pd.to_datetime(closes.index, utc=True).tz_convert("US/Eastern")
     closes = closes.between_time(RTH_START, RTH_END)
 
@@ -209,7 +210,7 @@ def load_data():
     if not regimes_path.exists():
         raise FileNotFoundError(
             "regimes.csv not found — run hmm.py (step 3b) first")
-    regimes = pd.read_csv(regimes_path, index_col=0, parse_dates=True)
+    regimes = fast_read(regimes_path, prefer_parquet=False, fast_bars=0, log_label=regimes_path.name)
     if not isinstance(regimes.index, pd.DatetimeIndex):
         regimes.index = pd.to_datetime(regimes.index, utc=True)
     if regimes.index.tz is None:
@@ -218,7 +219,7 @@ def load_data():
         regimes.index = regimes.index.tz_convert("US/Eastern")
 
     # Pairs metadata
-    pairs = pd.read_csv(DATA_DIR / "pairs_selected.csv")
+    pairs = fast_read(DATA_DIR / "pairs_selected.csv", prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label="pairs_selected.csv")
 
     return closes, regimes, pairs
 

@@ -24,7 +24,7 @@ from scipy.stats import gaussian_kde
 from config import (
     COINT_WINDOW_DAYS, COINT_BREAK_P, COINT_RECHECK_DAYS,
     BARS_PER_DAY,
-    HURST_ENTRY_WINDOW, HURST_ENTRY_MAX,
+    HURST_ENTRY_WINDOW, HURST_ENTRY_SOFT_MAX, HURST_ENTRY_MAX,
 )
 
 # Intraday window for lazy ADF: same calendar span as daily pre-compute
@@ -150,15 +150,29 @@ class MacroFilter:
 
     # ── Public API ────────────────────────────────────────────────────────
     def is_entry_blocked(self, ts) -> bool:
-        """True → do not open new positions on this bar."""
+        """True → do not open new positions on this bar.
+
+        K-Means gate is a hard block only in Panic=2. Trend=0 stays tradable
+        for FX stat-arb and is handled via a soft size multiplier instead.
+        """
         d = _to_date(ts)
         if self._alert.get(d, False):          # VIX9D backwardation
             return True
-        if self._km and self._km.get(d, 1) != 1:  # K-Means: only Sideways=1 allowed
+        if self._km and self._km.get(d, 1) == 2:  # K-Means: only Panic=2 blocks
             return True
         if self._hmm.get(d, 0) == 1:           # global SPY HMM panic
             return True
         return False
+
+    def km_size_multiplier(self, ts) -> float:
+        """Soft position size scaling by K-Means regime."""
+        d = _to_date(ts)
+        regime = self._km.get(d, 1)
+        if regime == 1:
+            return 1.0
+        if regime == 0:
+            return 0.5
+        return 0.0
 
     def is_force_close(self, ts) -> bool:
         """True → immediately close any open position on this bar."""
@@ -178,16 +192,13 @@ class MacroFilter:
 # ── HurstFilter ───────────────────────────────────────────────────────────────
 
 def get_hurst_multiplier(h_val: float) -> float:
-    """
-    Tier-1 Soft Sizing.
-    H <= 0.50: 1.0 (Full size)
-    H = 0.65:  0.3 (Reduced size)
-    """
-    if h_val <= 0.50: return 1.0
-    if h_val >= 0.65: return 0.3
-    
-    # Linear scale-down
-    penalty = (h_val - 0.50) / (0.65 - 0.50)
+    """Soft size penalty in the guarded Hurst band."""
+    if h_val <= HURST_ENTRY_SOFT_MAX:
+        return 1.0
+    if h_val >= HURST_ENTRY_MAX:
+        return 0.0
+
+    penalty = (h_val - HURST_ENTRY_SOFT_MAX) / (HURST_ENTRY_MAX - HURST_ENTRY_SOFT_MAX)
     return max(0.3, 1.0 - penalty * 0.7)
 
 class HurstFilter:
@@ -198,13 +209,15 @@ class HurstFilter:
     Purpose: catch structural drift where the spread is trending.
     """
 
-    def __init__(self, h_max: float = 0.65, # Relaxed to 0.65
+    def __init__(self, h_soft_max: float = HURST_ENTRY_SOFT_MAX,
+                 h_max: float = HURST_ENTRY_MAX,
                  window: int = HURST_ENTRY_WINDOW,
                  hurst_lag: int = 10):
+        self._h_soft_max = h_soft_max
         self._h_max  = h_max
         self._window = window
         self._hurst_lag = hurst_lag
-        self._cache: dict[_date, tuple[bool, float]] = {}
+        self._cache: dict[_date, tuple[bool, float, bool]] = {}
 
     def compute_hurst(self, spread_series: pd.Series) -> pd.Series:
         if len(spread_series) < self._window + self._hurst_lag:
@@ -220,16 +233,16 @@ class HurstFilter:
         hurst = 0.5 * (np.log(var_tau / var_1) / np.log(self._hurst_lag))
         return hurst.fillna(0.5)
 
-    def should_block(self, spread_tail: pd.Series, ts) -> tuple[bool, float]:
-        """Returns (should_block, hurst_value). Cached per calendar day."""
+    def should_block(self, spread_tail: pd.Series, ts) -> tuple[bool, float, bool]:
+        """Returns (should_block, hurst_value, guarded_mode). Cached per day."""
         key = _to_date(ts)
         if key in self._cache:
             return self._cache[key]
 
         s = spread_tail.dropna()
         if len(s) < self._window + self._hurst_lag:
-            self._cache[key] = (False, 0.5)
-            return False, 0.5
+            self._cache[key] = (False, 0.5, False)
+            return False, 0.5, False
 
         # Calculate only the last value for performance in hot loop
         diff_1 = s.diff(1).tail(self._window)
@@ -242,10 +255,11 @@ class HurstFilter:
             h = 0.5
         else:
             h = 0.5 * (np.log(vt / v1) / np.log(self._hurst_lag))
-            
+
         blocked = h > self._h_max
-        self._cache[key] = (blocked, h)
-        return blocked, h
+        guarded = self._h_soft_max < h <= self._h_max
+        self._cache[key] = (blocked, h, guarded)
+        return blocked, h, guarded
 
 
 # ── Helper ────────────────────────────────────────────────────────────────────

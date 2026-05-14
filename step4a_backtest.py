@@ -1,6 +1,5 @@
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 import statsmodels.api as sm
 import os
 from pathlib import Path
@@ -30,6 +29,8 @@ from config import (
     USE_COPULA, COPULA_WINDOW, COPULA_Z_MIN, COPULA_LAMBDA_MIN,
     EVENT_FILTER, EVENT_BARS_BEFORE, EVENT_BARS_AFTER, BAR_MINUTES,
     ENTRY_Z_MIN,
+    HURST_GUARDED_ENTRY_ADD, HURST_GUARDED_EXIT_Z,
+    WFO_SKIP_VOLUMES,
 )
 from kalman import kalman_hedge
 from step3e_sizing import (
@@ -40,15 +41,21 @@ from filters import CointegrationFilter, MacroFilter, HurstFilter, _LAZY_WINDOW_
 from copula_signals import compute_copula_signals
 from macro_calendar import build_event_blackout
 from config import HURST_ENTRY_WINDOW
+from utils import fast_read, save_with_parquet
+from execution_stress import ExecutionSimulator, ExecutionResult
 
 BARS_PER_TRADING_DAY = BARS_PER_DAY
+_RECENT_BARS_ENV = int(os.getenv("BACKTEST_RECENT_BARS", "0") or 0)
+BACKTEST_SMOKE = os.getenv("BACKTEST_SMOKE", "0") == "1"
+BACKTEST_SKIP_PLOTS = BACKTEST_SMOKE or os.getenv("BACKTEST_SKIP_PLOTS", "0") == "1"
+BACKTEST_PROGRESS = BACKTEST_SMOKE or os.getenv("BACKTEST_PROGRESS", "0") == "1"
 
 
 def _pairs_universe_path() -> str:
     zero_path = DATA_DIR / "pairs_zero_universe.csv"
     if ACCOUNT_MODEL == "Zero" and zero_path.exists():
         try:
-            if not pd.read_csv(zero_path, nrows=1).empty:
+            if not fast_read(zero_path, prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, nrows=1, log_label=zero_path.name).empty:
                 return str(zero_path)
         except Exception:
             pass
@@ -80,7 +87,7 @@ def load_closes() -> pd.DataFrame:
     pairs_path = Path(_pairs_universe_path())
     tickers = None
     if pairs_path.exists():
-        meta = pd.read_csv(pairs_path)
+        meta = fast_read(pairs_path, prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label=pairs_path.name)
         if not meta.empty:
             meta = meta[meta["pair"].map(_is_fx_pair)]
             if not meta.empty:
@@ -90,7 +97,7 @@ def load_closes() -> pd.DataFrame:
         from data_loader import load_closes as _load_closes
         closes = _load_closes(tickers, rth=True)
     except Exception:
-        closes = pd.read_csv(_data_path(), index_col=0, parse_dates=True)
+        closes = fast_read(_data_path(), columns=tickers, log_label=Path(_data_path()).name)
         if tickers is not None:
             closes = closes[[c for c in tickers if c in closes.columns]]
         closes.index = pd.to_datetime(closes.index, utc=True)
@@ -105,7 +112,7 @@ def load_closes() -> pd.DataFrame:
         closes.loc[col_ret > 0.05, col] = np.nan
 
     if pairs_path.exists():
-        meta = pd.read_csv(pairs_path)
+        meta = fast_read(pairs_path, prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label=pairs_path.name)
         if not meta.empty:
             meta = meta[meta["pair"].map(_is_fx_pair)]
             needed    = {t for p in meta["pair"] for t in p.split("-")}
@@ -302,7 +309,7 @@ def load_kmeans_regime() -> pd.Series | None:
     path = DATA_DIR / "kmeans_regimes.csv"
     if not path.exists():
         return None
-    s = pd.read_csv(path, index_col=0, parse_dates=True).iloc[:, 0]
+    s = fast_read(path, prefer_parquet=False, fast_bars=0, log_label=path.name).iloc[:, 0]
     if s.index.tz is None:
         s.index = s.index.tz_localize("UTC")
     return s
@@ -406,7 +413,8 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                   oos_start: pd.Timestamp | None = None,
                   max_notional: float = 1e9,
                   max_hold_bars: int = 9999,
-                  session_window: tuple[int, int] | None = None) -> pd.DataFrame:
+                  session_window: tuple[int, int] | None = None,
+                  exec_sim: "ExecutionSimulator | None" = None) -> pd.DataFrame:
     """
     oos_start    : first timestamp of OOS — Kalman warms up on full history,
                    entries blocked before this date.
@@ -423,11 +431,30 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
     cumulative_pnl = 0.0
     trades         = []
     hurst_blocked  = 0       # count of entries blocked by Hurst drift guard
+    hurst_guarded  = 0       # count of entries allowed only in guarded Hurst mode
     suspended      = False   # True when daily coint check says broken
     _cb_cooldown   = 0       # circuit-breaker cooldown counter (bars remaining)
     active_exit_thresh = exit_thresh   # exit/stop thresholds active for current trade
     active_stop_thresh = stop_thresh   # (may change per regime at entry time)
     diag = Counter()
+
+    # ── prices_df for ExecutionSimulator (one-shot precompute) ────────────
+    if exec_sim is not None:
+        _sim_cols: dict[str, pd.Series] = {"close": df["spread"]}
+        if "spread_vwap_mtf" in df.columns:
+            _sim_cols["vwap"] = df["spread_vwap_mtf"]
+        if "vol_ratio" in df.columns:
+            _sim_cols["vol_ratio"] = df["vol_ratio"]
+        if "hmm_regime" in df.columns:
+            _sim_cols["hmm_regime"] = df["hmm_regime"]
+        if "tox_buy" in df.columns:
+            _sim_cols["tox_buy"] = df["tox_buy"]
+        if "tox_sell" in df.columns:
+            _sim_cols["tox_sell"] = df["tox_sell"]
+        _prices_df = pd.DataFrame(_sim_cols, index=df.index)
+        exec_sim.precompute(_prices_df)
+    else:
+        _prices_df = None
 
     for i in range(len(df)):
         ts         = df.index[i]
@@ -481,7 +508,11 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
             )
         if position != 0 and force_close:
             n              = entry_n_shares
-            gross_pnl      = position * (spread_now - entry_spread) * n
+            if exec_sim is not None:
+                _exit_mid  = exec_sim.stress_exit_price(_prices_df, bar_index=i, side_to_close=-position)
+                gross_pnl  = position * (_exit_mid - entry_spread) * n
+            else:
+                gross_pnl  = position * (spread_now - entry_spread) * n
             notional       = (entry_t1 + abs(entry_beta) * entry_t2) * n
             tx_cost        = notional * COST_MAKER + notional * COST_TAKER
             holding_days   = (i - entry_bar) / BARS_PER_TRADING_DAY
@@ -525,7 +556,11 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
 
             if exit_signal or stop_signal or time_stop:
                 n              = entry_n_shares
-                gross_pnl      = position * (spread_now - entry_spread) * n
+                if exec_sim is not None:
+                    _exit_mid = exec_sim.stress_exit_price(_prices_df, bar_index=i, side_to_close=-position)
+                    gross_pnl = position * (_exit_mid - entry_spread) * n
+                else:
+                    gross_pnl = position * (spread_now - entry_spread) * n
                 notional       = (entry_t1 + abs(entry_beta) * entry_t2) * n
                 # Maker entry + Maker exit (if TP), otherwise Taker exit
                 tx_cost        = notional * COST_MAKER + notional * (COST_MAKER if exit_signal else COST_TAKER)
@@ -584,6 +619,8 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                     sizing_args.get("macro_alert_s"),
                     sizing_args.get("global_hmm_s"),
                 )
+                if macro_filter is not None:
+                    sz *= macro_filter.km_size_multiplier(ts)
                 if sz < MIN_POSITION_SIZE:
                     diag["size_too_small"] += 1
                     continue
@@ -750,13 +787,26 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                     h_tail_daily = spread_daily.loc[:d_prev].tail(HURST_ENTRY_WINDOW - 1)
                     # Append today's intraday spread to simulate the full tail
                     h_tail = pd.concat([h_tail_daily, pd.Series({ts: df["spread"].iloc[i]})])
-                    
-                    h_blocked, h_val = hurst_filter.should_block(h_tail, ts)
+
+                    h_blocked, h_val, h_guarded = hurst_filter.should_block(h_tail, ts)
                     if h_blocked:
                         hurst_blocked += 1
                         diag["hurst"] += 1
                         position = 0
                         continue
+                    if h_guarded:
+                        hurst_guarded += 1
+                        diag["hurst_guarded"] += 1
+                        threshold = max(threshold, entry_z + HURST_GUARDED_ENTRY_ADD)
+                        exit_thresh_live = max(exit_thresh_live, HURST_GUARDED_EXIT_Z)
+                        if z < -threshold:
+                            position = 1
+                        elif z > threshold:
+                            position = -1
+                        else:
+                            diag["hurst_guarded_reject"] += 1
+                            position = 0
+                            continue
 
                 # Execute at NEXT bar (signal on close i, fill on bar i+1)
                 next_i = i + 1
@@ -764,7 +814,38 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                     diag["no_next_bar"] += 1
                     position = 0
                     continue
-                entry_spread   = df["spread"].iloc[next_i]
+                if exec_sim is not None:
+                    _fill = exec_sim.simulate_order(
+                        _prices_df,
+                        signal_index=i,
+                        side=position,
+                        requested_price=float(df["spread"].iloc[next_i]),
+                        order_type="limit",
+                    )
+                    if _fill.status != "FILLED":
+                        trades.append({
+                            "pair":         f"{t1}-{t2}",
+                            "entry_time":   df.index[i],
+                            "exit_time":    df.index[i],
+                            "direction":    "LONG" if position == 1 else "SHORT",
+                            "holding_bars": 0,
+                            "n_shares":     0.0,
+                            "size":         0.0,
+                            "gross_pnl":    0.0,
+                            "tx_cost":      0.0,
+                            "borrow_cost":  0.0,
+                            "net_pnl":      0.0,
+                            "cum_pnl":      round(cumulative_pnl, 4),
+                            "exit_reason":  _fill.reason,
+                            "entry_z":      round(z, 2),
+                            "exit_z":       round(z, 2),
+                        })
+                        diag[f"exec_{_fill.reason}"] += 1
+                        position = 0
+                        continue
+                    entry_spread = _fill.fill_price
+                else:
+                    entry_spread = df["spread"].iloc[next_i]
                 entry_t1       = df[t1_col].iloc[next_i]
                 entry_t2       = df[t2_col].iloc[next_i]
                 entry_beta     = df["beta"].iloc[next_i]
@@ -787,13 +868,14 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
 
     out = pd.DataFrame(trades)
     out.attrs["diag"] = dict(diag)
+    out.attrs["hurst_guarded"] = hurst_guarded
     return out
 
 
 # ── Load ─────────────────────────────────────────────────────────────────────
 closes = load_closes()
 pairs_path = Path(_pairs_universe_path())
-pairs  = pd.read_csv(pairs_path)
+pairs = fast_read(pairs_path, prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label=pairs_path.name)
 pairs  = pairs[pairs["pair"].map(_is_fx_pair)].reset_index(drop=True)
 if pairs.empty:
     raise SystemExit("No FX pairs available after commodity filter.")
@@ -804,13 +886,19 @@ _volumes: pd.DataFrame | None = None
 _vwaps:   pd.DataFrame | None = None
 
 if USE_VWZ:
-    try:
-        from data_loader import load_volumes
-        _volumes = load_volumes(needed_tickers, start=str(closes.index[0].date()))
-        _volumes = _volumes.reindex(closes.index)
-        print(f"VW-Z enabled  — volumes loaded  ({_volumes.shape[1]} tickers)")
-    except Exception as _e:
-        print(f"VW-Z: volumes unavailable ({_e}) — using equal-weight Z")
+    if WFO_SKIP_VOLUMES:
+        print("VW-Z disabled by WFO_SKIP_VOLUMES=True — using equal-weight Z")
+    else:
+        try:
+            from data_loader import load_volumes
+            _volumes = load_volumes(needed_tickers, start=str(closes.index[0].date()))
+            if _volumes is not None:
+                _volumes = _volumes.reindex(closes.index)
+                print(f"VW-Z enabled  — volumes loaded  ({_volumes.shape[1]} tickers)")
+            else:
+                print("VW-Z: volumes skipped — using equal-weight Z")
+        except Exception as _e:
+            print(f"VW-Z: volumes unavailable ({_e}) — using equal-weight Z")
 
 if USE_VWAP:
     try:
@@ -840,7 +928,7 @@ _sessions: dict[str, tuple[int, int]] = {}
 if SESSION_FILTER:
     _sess_path = DATA_DIR / "pair_sessions.csv"
     if _sess_path.exists():
-        _sess_df = pd.read_csv(_sess_path).set_index("pair")
+        _sess_df = fast_read(_sess_path, prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label=_sess_path.name).set_index("pair")
         for _pair, _row in _sess_df.iterrows():
             _sessions[str(_pair)] = (int(_row["best_start_utc"]), int(_row["best_end_utc"]))
         print(f"Session filter — {len(_sessions)} pair windows loaded")
@@ -851,7 +939,7 @@ if SESSION_FILTER:
 _daily_cache = DATA_DIR / "closes_daily.csv"
 _daily: pd.DataFrame | None = None
 if _daily_cache.exists():
-    _daily = pd.read_csv(_daily_cache, index_col=0, parse_dates=True)
+    _daily = fast_read(_daily_cache, columns=needed_tickers, log_label=_daily_cache.name)
     _daily.index = pd.to_datetime(_daily.index, utc=True)
     print(f"Daily cache loaded for rolling coint check  ({len(_daily)} days)")
 else:
@@ -914,7 +1002,7 @@ print(f"Dynamic sizing: {layers_active}/3 layers active "
 regime_data: dict[str, dict] = {}
 regimes_path = DATA_DIR / "regimes.csv"
 if regimes_path.exists():
-    reg_df = pd.read_csv(regimes_path, index_col=0, parse_dates=True)
+    reg_df = fast_read(regimes_path, prefer_parquet=False, fast_bars=0, log_label=regimes_path.name)
     try:
         if reg_df.index.tz is None:
             reg_df.index = reg_df.index.tz_localize("UTC").tz_convert("US/Eastern")
@@ -948,7 +1036,7 @@ else:
     # optimal_params.csv (step3f) takes priority — it's fitted on the current pair
     # universe with the current filter stack, so it's more relevant than old WFO runs.
     if _wfo_path.exists():
-        _opt_df = pd.read_csv(_wfo_path)
+        _opt_df = fast_read(_wfo_path, prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label=_wfo_path.name)
         for _, _r in _opt_df.sort_values("oos_end").iterrows():
             _opt_params[_r["pair"]] = (float(_r["entry_z"]),
                                        float(_r["exit_z"]),
@@ -956,7 +1044,7 @@ else:
         print(f"WFO baseline loaded   (wfo_params.csv):      {len(_opt_params)} pairs")
 
     if _opt_path.exists():
-        _grid_df = pd.read_csv(_opt_path)
+        _grid_df = fast_read(_opt_path, prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label=_opt_path.name)
         n_before = len(_opt_params)
         for _, _r in _grid_df.iterrows():
             _opt_params[_r["pair"]] = (float(_r["entry_z"]),
@@ -973,7 +1061,7 @@ if not _opt_params:
 _regime_thresholds: dict[str, dict] = {}
 _rt_path = DATA_DIR / "regime_thresholds.csv"
 if _rt_path.exists():
-    _rt_df = pd.read_csv(_rt_path)
+    _rt_df = fast_read(_rt_path, prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label=_rt_path.name)
     for _, _r in _rt_df[_rt_df["regime"] == 1].iterrows():
         _regime_thresholds[_r["pair"]] = {
             "vol_entry": float(_r["entry_z"]),
@@ -1004,7 +1092,7 @@ def compute_pair_weights(pairs_df: pd.DataFrame,
     if method == "equal" or not opt_path.exists():
         return equal
 
-    opt = pd.read_csv(opt_path)
+    opt = fast_read(opt_path, prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label=Path(opt_path).name)
     if "train_sharpe" not in opt.columns:
         return equal
 
@@ -1228,10 +1316,26 @@ print(f"Pair max loss cutoff: {PAIR_MAX_LOSS}\n")
 pair_results = {}
 zero_universe_rows: list[dict[str, object]] = []
 
-for _, row in pairs.iterrows():
+_exec_sim = ExecutionSimulator(
+    base_spread=COST_MAKER,
+    spread_gamma=1.5,
+    panic_multiplier=3.0,
+    entry_delay=1,
+    slippage_variance=0.0,
+    fill_kappa=2.0,
+    passive=True,
+    use_vwap=True,
+    random_seed=42,
+    toxicity_threshold=None,
+)
+
+for pair_idx, (_, row) in enumerate(pairs.iterrows(), start=1):
     t1, t2    = row["pair"].split("-")
     beta      = float(row.get("beta_daily", row["beta"]) or row["beta"])
     half_life = row["half_life_bars"]
+
+    if BACKTEST_PROGRESS:
+        print(f"[{pair_idx}/{len(pairs)}] {row['pair']} build_signals", flush=True)
 
     if t1 not in closes.columns or t2 not in closes.columns:
         print(f"  SKIP {row['pair']}: missing ticker data")
@@ -1244,6 +1348,9 @@ for _, row in pairs.iterrows():
 
     df_sig = build_signals(closes, t1, t2, beta, half_life,
                            volumes=_volumes, vwaps=_vwaps)
+
+    if BACKTEST_PROGRESS:
+        print(f"[{pair_idx}/{len(pairs)}] {row['pair']} signals={len(df_sig)}", flush=True)
 
     # Attach event blackout column (aligned by position in closes.index)
     if EVENT_FILTER and _event_blackout_arr is not None:
@@ -1310,14 +1417,25 @@ for _, row in pairs.iterrows():
                            oos_start=_oos_start,
                            max_notional=pair_max_notl,
                            max_hold_bars=pair_half_life * 2,
-                           session_window=_sessions.get(row["pair"]))
+                           session_window=_sessions.get(row["pair"]),
+                           exec_sim=_exec_sim)
+
+    if BACKTEST_PROGRESS:
+        print(f"[{pair_idx}/{len(pairs)}] {row['pair']} raw_trades={len(trades)}", flush=True)
     diag = trades.attrs.get("diag", {})
     top_blocks = ", ".join(
         f"{k}={v}" for k, v in sorted(diag.items(), key=lambda kv: -kv[1])[:5]
         if k not in {"no_z_trigger", "pre_oos"}
     )
 
-    if trades.empty:
+    # Exclude execution-rejection stubs (holding_bars=0) from real-trade analysis.
+    # They are kept in trades for fill_rate accounting but must not pollute
+    # zero_account_report (which counts trade days and profitable days).
+    _exec_reject_reasons = {"LIMIT_NOT_FILLED", "TOXIC_FLOW_CANCEL", "NO_BAR_AFTER_LATENCY"}
+    real_trades = (trades[~trades["exit_reason"].isin(_exec_reject_reasons)]
+                   if "exit_reason" in trades.columns else trades)
+
+    if real_trades.empty:
         detail = f"  blocks: {top_blocks}" if top_blocks else ""
         print(f"  {row['pair']:12s}  0 trades{detail}")
         continue
@@ -1327,34 +1445,35 @@ for _, row in pairs.iterrows():
     # The old u = capital_now / notional_now formula was double-converting the units.
     dollar_pnls, dollar_grosses, dollar_costses, units_list = [], [], [], []
 
-    for idx in range(len(trades)):
-        gp  = trades["gross_pnl"].iloc[idx]
-        tc  = trades["tx_cost"].iloc[idx]
-        bc  = trades["borrow_cost"].iloc[idx]
-        np_ = trades["net_pnl"].iloc[idx]
+    for idx in range(len(real_trades)):
+        gp  = real_trades["gross_pnl"].iloc[idx]
+        tc  = real_trades["tx_cost"].iloc[idx]
+        bc  = real_trades["borrow_cost"].iloc[idx]
+        np_ = real_trades["net_pnl"].iloc[idx]
 
         dollar_pnls.append(round(np_, 2))
         dollar_grosses.append(round(gp, 2))
         dollar_costses.append(round(tc + bc, 2))
-        units_list.append(trades["n_shares"].iloc[idx])
+        units_list.append(real_trades["n_shares"].iloc[idx])
 
-    trades["dollar_pnl"]     = dollar_pnls
-    trades["dollar_gross"]   = dollar_grosses
-    trades["dollar_costs"]   = dollar_costses
-    trades["units_per_pair"] = units_list
+    real_trades = real_trades.copy()
+    real_trades["dollar_pnl"]     = dollar_pnls
+    real_trades["dollar_gross"]   = dollar_grosses
+    real_trades["dollar_costs"]   = dollar_costses
+    real_trades["units_per_pair"] = units_list
 
-    pnl      = trades["net_pnl"]
+    pnl      = real_trades["net_pnl"]
     win_rate = (pnl > 0).mean() * 100
-    disabled = trades["cum_pnl"].iloc[-1] < PAIR_MAX_LOSS
+    disabled = real_trades["cum_pnl"].iloc[-1] < PAIR_MAX_LOSS
     status   = " [DISABLED — max loss hit]" if disabled else ""
 
-    zero = zero_account_report(trades, INITIAL_CAPITAL)
+    zero = zero_account_report(real_trades, INITIAL_CAPITAL)
     zero_ok = zero_universe_ok(zero)
     zero_universe_rows.append({
         **row.to_dict(),
         "pair": row["pair"],
-        "net_pnl": round(float(trades["dollar_pnl"].sum()), 4),
-        "trades": int(len(trades)),
+        "net_pnl": round(float(real_trades["dollar_pnl"].sum()), 4),
+        "trades": int(len(real_trades)),
         "win_rate": round(float(win_rate), 1),
         "max_trade_days_30d": int(zero["max_trade_days_30d"]),
         "max_profit_days_30d": int(zero["max_profit_days_30d"]),
@@ -1363,7 +1482,7 @@ for _, row in pairs.iterrows():
         "max_profit_days_60d": int(zero["max_profit_days_60d"]),
         "max_60d_pnl": float(zero["max_60d_pnl"]),
         "max_inactive_days": zero["max_inactive_days"],
-        "hard_zero_breach": trades.attrs.get("zero_hard_stop"),
+        "hard_zero_breach": trades.attrs.get("zero_hard_stop"),  # attrs on original trades
         "zero_universe_ok": bool(zero_ok),
     })
 
@@ -1374,11 +1493,11 @@ for _, row in pairs.iterrows():
               f"gap={zero['max_inactive_days']})")
         continue
 
-    pair_results[row["pair"]] = {"trades": trades, "signals": df_sig}
+    pair_results[row["pair"]] = {"trades": real_trades, "signals": df_sig}
     hurst_blk = sum(1 for v in pair_hurst_f._cache.values() if v[0])
     hurst_tag = f"  H_blk={hurst_blk}" if hurst_blk > 0 else ""
     diag_tag = f"  blocks: {top_blocks}" if top_blocks else ""
-    print(f"  {row['pair']:12s}  trades={len(trades):3d}  "
+    print(f"  {row['pair']:12s}  trades={len(real_trades):3d}  "
           f"WR={win_rate:4.1f}%  net P&L={pnl.sum():+.4f}{status}{hurst_tag}{diag_tag}")
 
 if ACCOUNT_MODEL == "Zero":
@@ -1462,6 +1581,16 @@ print(f"Sharpe:        {sharpe:.2f}")
 print(f"Avg hold:      {df_trades['holding_bars'].mean():.0f} bars "
       f"({df_trades['holding_bars'].mean()/BARS_PER_TRADING_DAY:.1f} days)")
 
+if "exit_reason" in df_trades.columns:
+    total_signals  = len(df_trades)
+    toxic_cancels  = int((df_trades["exit_reason"] == "TOXIC_FLOW_CANCEL").sum())
+    limit_misses   = int((df_trades["exit_reason"] == "LIMIT_NOT_FILLED").sum())
+    no_latency     = int((df_trades["exit_reason"] == "NO_BAR_AFTER_LATENCY").sum())
+    filled_signals = total_signals - toxic_cancels - limit_misses - no_latency
+    fill_rate      = filled_signals / max(total_signals, 1)
+    print(f"Fill rate:     {fill_rate:.1%}  "
+          f"(toxic_cancels={toxic_cancels}, limit_misses={limit_misses}, no_bar_after_latency={no_latency})")
+
 zero = zero_account_report(df_trades, INITIAL_CAPITAL)
 print(f"\n{'='*60}")
 print("FUNDINGPIPS ZERO CHECK (realized-exit approximation)")
@@ -1499,7 +1628,7 @@ for pair_name, data in pair_results.items():
     print(f"{pair_name:<12} {len(t):>6} {wr:>5.1f}% {dollar_p:>+8.2f}$ {p.sum():>+10.4f} "
           f"{sh:>7.2f} {ah:>6.1f}d {status:>10}")
 
-df_trades.to_csv(DATA_DIR / "trades.csv", index=False)
+save_with_parquet(df_trades, DATA_DIR / "trades.csv", index=False)
 print(f"\nSaved {len(df_trades)} trades to {DATA_DIR / 'trades.csv'}")
 
 # ── SPY benchmark ─────────────────────────────────────────────────────────────
@@ -1510,7 +1639,7 @@ try:
     test_end   = closes.index[-1].tz_convert("UTC").tz_localize(None)
     daily_path = DATA_DIR / "closes_daily.csv"
     if daily_path.exists():
-        daily = pd.read_csv(daily_path, index_col=0, parse_dates=True)
+        daily = fast_read(daily_path, fast_bars=0, log_label=daily_path.name)
         if "spxusd" in daily.columns:
             spy_close = daily["spxusd"].dropna()
             spy_close.index = pd.to_datetime(spy_close.index).tz_localize(None)
@@ -1556,72 +1685,79 @@ if spy_return is not None:
     alpha = sharpe - spy_sharpe
     print(f"Alpha (Sharpe):    {alpha:+.2f}")
 
-# ── Charts ────────────────────────────────────────────────────────────────────
-OUTPUT_DIR.mkdir(exist_ok=True)
-exit_times = pd.to_datetime(df_trades["exit_time"])
+if BACKTEST_SKIP_PLOTS:
+    print("\nPlot generation skipped (BACKTEST_SKIP_PLOTS/BACKTEST_SMOKE enabled)")
+else:
+    # ── Charts ────────────────────────────────────────────────────────────────
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
-n_rows = 3 if spy_return is not None else 2
-fig, axes = plt.subplots(n_rows, 1, figsize=(14, 5 * n_rows))
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    exit_times = pd.to_datetime(df_trades["exit_time"])
 
-ax = axes[0]
-ax.plot(exit_times, cumulative.values, color="blue", lw=2, label="Portfolio net P&L")
-ax.plot(exit_times, df_trades["gross_pnl"].cumsum().values,
-        color="blue", lw=1, linestyle="--", alpha=0.35, label="Gross P&L")
-ax.axhline(PAIR_MAX_LOSS, color="red", linestyle=":", lw=1, alpha=0.5,
-           label=f"Max loss cutoff ({PAIR_MAX_LOSS})")
-ax.axhline(0, color="black", lw=0.8)
-ax.set_title(f"Portfolio Equity Curve  [OUT-OF-SAMPLE: "
-             f"{closes.index[0].date()} → {closes.index[-1].date()}]")
-ax.set_ylabel("Cumulative net P&L")
-ax.legend()
+    n_rows = 3 if spy_return is not None else 2
+    fig, axes = plt.subplots(n_rows, 1, figsize=(14, 5 * n_rows))
 
-ax = axes[1]
-colors = plt.cm.tab10(np.linspace(0, 1, len(pair_results)))
-for (pair_name, data), color in zip(pair_results.items(), colors):
-    t  = data["trades"]
-    et = pd.to_datetime(t["exit_time"])
-    ax.plot(et, t["net_pnl"].cumsum().values, label=pair_name, color=color, lw=1.5)
-ax.axhline(0, color="black", lw=0.8)
-ax.set_title("Per-pair Equity Curves")
-ax.set_ylabel("Cumulative net P&L")
-ax.legend(fontsize=8)
-
-if spy_return is not None and n_rows == 3:
-    ax = axes[2]
-    ax2 = ax.twinx()
-
-    # Strategy: normalise cumulative to % starting from 0
-    first_trade_val = cumulative.values[0]
-    strat_norm = (cumulative.values - first_trade_val) / max(abs(first_trade_val), 1) * 100
-
-    ax.plot(exit_times, strat_norm, color="blue", lw=2, label="Strategy (normalised %)")
-    ax2.plot(spy_cum.index, (spy_cum.values - 1) * 100, color="orange",
-             lw=2, linestyle="--", label=f"SPY buy & hold")
-
+    ax = axes[0]
+    ax.plot(exit_times, cumulative.values, color="blue", lw=2, label="Portfolio net P&L")
+    ax.plot(exit_times, df_trades["gross_pnl"].cumsum().values,
+            color="blue", lw=1, linestyle="--", alpha=0.35, label="Gross P&L")
+    ax.axhline(PAIR_MAX_LOSS, color="red", linestyle=":", lw=1, alpha=0.5,
+               label=f"Max loss cutoff ({PAIR_MAX_LOSS})")
     ax.axhline(0, color="black", lw=0.8)
-    ax.set_ylabel("Strategy return (%)", color="blue")
-    ax2.set_ylabel("SPY return (%)", color="orange")
-    ax.set_title(f"Strategy vs SPY  |  Strategy Sharpe={sharpe:.2f}  "
-                 f"SPY Sharpe={spy_sharpe:.2f}")
+    ax.set_title(f"Portfolio Equity Curve  [OUT-OF-SAMPLE: "
+                 f"{closes.index[0].date()} → {closes.index[-1].date()}]")
+    ax.set_ylabel("Cumulative net P&L")
+    ax.legend()
 
-    lines1, labels1 = ax.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax.legend(lines1 + lines2, labels1 + labels2, fontsize=8)
+    ax = axes[1]
+    colors = plt.cm.tab10(np.linspace(0, 1, len(pair_results)))
+    for (pair_name, data), color in zip(pair_results.items(), colors):
+        t  = data["trades"]
+        et = pd.to_datetime(t["exit_time"])
+        ax.plot(et, t["net_pnl"].cumsum().values, label=pair_name, color=color, lw=1.5)
+    ax.axhline(0, color="black", lw=0.8)
+    ax.set_title("Per-pair Equity Curves")
+    ax.set_ylabel("Cumulative net P&L")
+    ax.legend(fontsize=8)
 
-plt.tight_layout()
-plt.savefig(OUTPUT_DIR / "backtest_results.png", dpi=150)
-print(f"Chart saved to {OUTPUT_DIR / 'backtest_results.png'}")
+    if spy_return is not None and n_rows == 3:
+        ax = axes[2]
+        ax2 = ax.twinx()
 
-# ── Z-score debug plots per pair ──────────────────────────────────────────────
-try:
-    from step5f_debug_plot import plot_zscore_debug
-    print("\nGenerating Z-score debug plots …")
-    for pair_name, data in pair_results.items():
-        t1, t2 = pair_name.split("-")
-        ez, xz, sz = _opt_params.get(pair_name, (ENTRY_Z, EXIT_Z, STOP_Z))
-        plot_zscore_debug(
-            data["signals"], data["trades"],
-            pair_name, entry_z=ez, exit_z=xz, stop_z=sz,
-        )
-except Exception as _e:
-    print(f"Debug plots skipped: {_e}")
+        # Strategy: normalise cumulative to % starting from 0
+        first_trade_val = cumulative.values[0]
+        strat_norm = (cumulative.values - first_trade_val) / max(abs(first_trade_val), 1) * 100
+
+        ax.plot(exit_times, strat_norm, color="blue", lw=2, label="Strategy (normalised %)")
+        ax2.plot(spy_cum.index, (spy_cum.values - 1) * 100, color="orange",
+                 lw=2, linestyle="--", label=f"SPY buy & hold")
+
+        ax.axhline(0, color="black", lw=0.8)
+        ax.set_ylabel("Strategy return (%)", color="blue")
+        ax2.set_ylabel("SPY return (%)", color="orange")
+        ax.set_title(f"Strategy vs SPY  |  Strategy Sharpe={sharpe:.2f}  "
+                     f"SPY Sharpe={spy_sharpe:.2f}")
+
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2, fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "backtest_results.png", dpi=150)
+    print(f"Chart saved to {OUTPUT_DIR / 'backtest_results.png'}")
+
+    # ── Z-score debug plots per pair ──────────────────────────────────────────
+    try:
+        from step5f_debug_plot import plot_zscore_debug
+        print("\nGenerating Z-score debug plots …")
+        for pair_name, data in pair_results.items():
+            t1, t2 = pair_name.split("-")
+            ez, xz, sz = _opt_params.get(pair_name, (ENTRY_Z, EXIT_Z, STOP_Z))
+            plot_zscore_debug(
+                data["signals"], data["trades"],
+                pair_name, entry_z=ez, exit_z=xz, stop_z=sz,
+            )
+    except Exception as _e:
+        print(f"Debug plots skipped: {_e}")

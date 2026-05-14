@@ -34,6 +34,7 @@ from config import (
     RTH_START, RTH_END, SIGNAL_START,
     KALMAN_DELTA, TRAIN_RATIO,
 )
+from utils import fast_read
 
 # ── Tunable parameters ────────────────────────────────────────────────────────
 TARGET_RR        = 1.3    # Fixed Reward / Risk ratio (Gatev-style constraint)
@@ -174,7 +175,7 @@ def load_closes() -> pd.DataFrame:
     path = DATA_DIR / CLOSES_FILE
     if not path.exists():
         path = DATA_DIR / "closes_15min.csv"
-    closes = pd.read_csv(path, index_col=0)
+    closes = fast_read(path, log_label=path.name)
     closes.index = pd.to_datetime(closes.index, utc=True).tz_convert("US/Eastern")
     return closes.between_time(RTH_START, RTH_END)
 
@@ -248,7 +249,7 @@ def _plot_pair(pair_name: str, df: pd.DataFrame, out_dir: Path):
 
 def main():
     closes = load_closes()
-    pairs  = pd.read_csv(DATA_DIR / "pairs_selected.csv")
+    pairs = fast_read(DATA_DIR / "pairs_selected.csv", prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label="pairs_selected.csv")
 
     if pairs.empty:
         raise SystemExit("pairs_selected.csv is empty — run pairs.py first")

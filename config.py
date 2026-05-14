@@ -59,20 +59,22 @@ BARS_PER_DAY = int(24 * 60 / BAR_MINUTES)      # 1440 for 1-min
 CLOSES_FILE  = f"closes_{BAR_MINUTES}min.csv"
 VOLUMES_FILE = f"volumes_{BAR_MINUTES}min.csv"
 VWAPS_FILE   = f"vwaps_{BAR_MINUTES}min.csv"
+FAST_RUN_BARS = 0          # 0 = full dataset, >0 = load only last N bars
+WFO_SKIP_VOLUMES = False   # True = skip volume CSV loads in WFO/backtests/profilers
 
 RECENT_BARS  = BARS_PER_DAY * 92             # ~4.6 months regardless of bar size
 TRAIN_RATIO  = 0.70   # first 70% → find pairs; last 30% → out-of-sample test
 
 CORR_THRESHOLD = 0.5
 CORR_TOP_N = 10
-COINT_TOP_N = 3
+COINT_TOP_N = 15   # step2b saves the full local universe; step2a is capped by this
 
 # ── Z-score thresholds — calibrated for 1-min FX majors ─────────────────────
 # Majors are liquid and tight-spread → Z-score is cleaner than exotics
-ENTRY_Z     = 2.0
-EXIT_Z      = 0.3    # exit before full mean reversion (lock in profit faster)
-STOP_Z      = 3.5
-ENTRY_Z_MIN = 1.8    # floor for grid search
+ENTRY_Z     = 1.8
+EXIT_Z      = 0.5    # faster profit realization for Zero profitable-day constraints
+STOP_Z      = 3.2
+ENTRY_Z_MIN = 1.7    # leave a small floor below live ENTRY_Z for WFO/grid space
 ENTRY_Z_VOLATILE = 3.5   # stricter threshold when HMM detects volatile regime (1-min noise)
 
 # ── Regime-Conditioned Profiling (RCDP) ─────────────────────────────────────
@@ -102,12 +104,12 @@ KALMAN_DELTA = 5e-5  # 1-min majors: adapt over ~20,000 bars ≈ 14 trading days
 USE_VWZ          = True
 VWZ_MIN_VOLUME   = 1.0
 USE_RVOL_GATE    = True
-RVOL_THRESHOLD   = 0.75    # Only trade if volume is > 75% of rolling average
+RVOL_THRESHOLD   = 0.60    # looser gate: keep thin-market protection without starving trades
 RVOL_WINDOW      = 200     # ~3.3 hours rolling baseline for "normal" volume
 
 # ── VWAP prices for Kalman input ─────────────────────────────────────────────
 USE_VWAP        = True
-USE_VWAP_MTF    = True     # Use higher-tf VWAP as a trend anchor
+USE_VWAP_MTF    = False    # disable hard higher-tf anchor gate; keep VWAP itself for Kalman input
 VWAP_MTF_TF     = "15min"  # 15-min anchor for 1-min strategy
 
 # ── Return-spread mode (for 1-min intraday trading) ──────────────────────────
@@ -118,7 +120,7 @@ USE_RETURN_SPREAD  = True
 RETURN_WINDOW      = 30   # bars over which to accumulate returns (30 min at 1-min)
 
 # ── Velocity gate ─────────────────────────────────────────────────────────────
-USE_VELOCITY_GATE = True
+USE_VELOCITY_GATE = False   # blocks first-touch mean-reversion entries with better observed Sharpe
 VELOCITY_WINDOW   = 5    # bars  →  5 × 1min = 5-min momentum window
 
 # ── Multi-Timeframe Z-score confirmation (MTF) ────────────────────────────────
@@ -138,7 +140,7 @@ LIVE_CORR_WINDOW = 60    # bars  →  60 min rolling correlation
 LIVE_CORR_MIN    = 0.45
 
 # ── Session filter ────────────────────────────────────────────────────────────
-SESSION_FILTER = True
+SESSION_FILTER = False   # 24h FX plus event blackout is sufficient for Zero profile
 
 # ── Macro event blackout ──────────────────────────────────────────────────────
 EVENT_FILTER      = True
@@ -146,7 +148,7 @@ EVENT_BARS_BEFORE = 10     # bars  →  10 min before release
 EVENT_BARS_AFTER  = 30     # bars  →  30 min after  release
 
 # ── Copula signals ───────────────────────────────────────────────────────────
-USE_COPULA         = True
+USE_COPULA         = False   # redundant with live_corr and innov_var for this profile
 COPULA_WINDOW      = 500    # bars  →  ~8 hours (enough warmup < 1 trading day)
 COPULA_Z_MIN       = 0.5
 COPULA_LAMBDA_MIN  = 0.10
@@ -167,7 +169,10 @@ HURST_MAX = 0.50    # max Hurst exponent for pair spread (< 0.5 = mean reverting
 # Computed lazily on the DAILY spread when |z| >= entry threshold.
 # Blocks entries when the spread is trending (structural drift), regardless of macro regime.
 HURST_ENTRY_WINDOW = 60     # daily bars of spread history for rolling Hurst at entry time
-HURST_ENTRY_MAX    = 0.55   # block entry if H > this (spread is trending, not stretching)
+HURST_ENTRY_SOFT_MAX = 0.50 # above this: guarded mean-reversion mode only
+HURST_ENTRY_MAX      = 0.55 # above this: reject the trade entirely
+HURST_GUARDED_ENTRY_ADD = 0.20
+HURST_GUARDED_EXIT_Z    = 0.50
 CORR_MIN  = 0.50    # min log-return correlation over training window
 RECENT_CORR_DAYS = 120   # rolling window for recent correlation check (calendar days)
 RECENT_CORR_MIN  = 0.50  # pair disabled if recent 120-day correlation drops below this
@@ -200,7 +205,7 @@ ZERO_MIN_PROFIT_DAYS_30D   = 7
 ZERO_MIN_PROFIT_DAYS_60D   = 14
 ZERO_MIN_PROFIT_DAY_PCT    = 0.0025
 
-PAIR_MAX_LOSS = -1500.0   # disable pair if cumulative net P&L drops below this (= -30 × 50 leverage)
+PAIR_MAX_LOSS = -75.0   # one broken pair must not consume the full Zero trailing buffer
 
 IV_LOOKBACK   = 60         # days for IV percentile calculation
 IV_THRESHOLD  = 75         # percentile above which → reduce position size
@@ -213,14 +218,14 @@ REGIME_MULT_VOLATILE = 0.3   # reduced size in volatile regime (per-pair HMM)
 HMM_PANIC_MULT       = 0.333 # global macro HMM panic: cut ALL sizes by 3
 IV_MULT_MAX          = 1.0   # full size when IV is at its lowest
 IV_MULT_MIN          = 0.5   # half size when IV is at its highest
-MIN_POSITION_SIZE    = 0.15  # skip trade entirely if combined size below this
+MIN_POSITION_SIZE    = 0.10  # allow reduced-size trades in stressed but tradable conditions
 
 INITIAL_CAPITAL = 5_000         # FundingPips Zero account size in USD
 LEVERAGE        = 50            # 1:50 leverage — max notional = INITIAL_CAPITAL × LEVERAGE
 ALLOCATION_METHOD = "equal"       # "equal" | "sharpe" | "markowitz" (MVO)
-MAX_PAIR_WEIGHT   = 0.15        # cap: no single pair gets more than 15% of capital
+MAX_PAIR_WEIGHT   = 0.10        # cap pair concentration for Zero account
 
-TARGET_RISK_USD = 150.0              # dollar risk per trade (1σ of spread) — leverage in cap_n only
+TARGET_RISK_USD = 20.0               # Zero-safe: total stop-risk stays below daily loss limit
 ENTRY_COST_SAFETY = 3.0              # expected gross edge must cover costs by this multiple
 
 # ── FundingPips Zero profile ────────────────────────────────────────────────

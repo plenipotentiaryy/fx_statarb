@@ -14,6 +14,7 @@ from config import (
     BARS_PER_DAY,
     DATA_DIR, OUTPUT_DIR,
 )
+from utils import fast_read
 
 VOL_WINDOW = 20   # bars for rolling features
 N_SEEDS    = int(os.getenv("HMM_N_SEEDS", "3"))   # HMM restarts — pick best log-likelihood
@@ -30,11 +31,11 @@ def _data_file():
             return fb
         raise FileNotFoundError(f"No data: {CLOSES_FILE}")
     return p
-closes = pd.read_csv(_data_file(), index_col=0)
+closes = fast_read(_data_file(), log_label=_data_file().name)
 closes.index = pd.to_datetime(closes.index, utc=True)
 closes = closes.between_time(RTH_START, RTH_END)
 
-pairs = pd.read_csv(DATA_DIR / "pairs_selected.csv")
+pairs = fast_read(DATA_DIR / "pairs_selected.csv", prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label="pairs_selected.csv")
 print(f"Pairs: {len(pairs)}\n")
 
 
@@ -254,7 +255,7 @@ print(f"Chart saved to {OUTPUT_DIR / 'regimes_pairs.png'}")
 def load_global_proxy() -> pd.Series | None:
     daily_path = DATA_DIR / "closes_daily.csv"
     if daily_path.exists():
-        daily = pd.read_csv(daily_path, index_col=0, parse_dates=True)
+        daily = fast_read(daily_path, fast_bars=0, log_label=daily_path.name)
         for col in ("spxusd", "SPY", "spy"):
             if col in daily.columns:
                 s = daily[col].dropna()

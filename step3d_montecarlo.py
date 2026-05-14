@@ -11,6 +11,7 @@ from config import (
     BARS_PER_DAY,
     DATA_DIR, OUTPUT_DIR,
 )
+from utils import fast_read
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--pairs", type=str, default="pairs_selected.csv")
@@ -132,14 +133,14 @@ def _data_file():
             return fb
         raise FileNotFoundError(f"No data: {CLOSES_FILE}")
     return p
-closes = pd.read_csv(_data_file(), index_col=0, parse_dates=True)
+closes = fast_read(_data_file(), log_label=_data_file().name)
 closes.index = pd.to_datetime(closes.index, utc=True)
 closes = closes.between_time(RTH_START, RTH_END).dropna().tail(RECENT_BARS)
 
 pairs_path = DATA_DIR / args.pairs
 if not pairs_path.exists():
     raise FileNotFoundError(f"Pairs file {pairs_path} not found.")
-pairs = pd.read_csv(pairs_path)
+pairs = fast_read(pairs_path, prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label=pairs_path.name)
 if pairs.empty:
     raise SystemExit("pairs_selected.csv is empty — run step2_pairs.py first")
 

@@ -12,6 +12,7 @@ from config import (
     IV_LOOKBACK, IV_THRESHOLD, IV_SIZE_HIGH, IV_SIZE_NORM,
     DATA_DIR, OUTPUT_DIR,
 )
+from utils import fast_read
 
 RISK_FREE_RATE = 0.045    # ~4.5% (approximate current US risk-free rate)
 MIN_OPTION_VOLUME = 10    # skip options with very low volume
@@ -124,7 +125,7 @@ if os.getenv("ALLOW_NETWORK") != "1":
     if not daily_path.exists():
         raise FileNotFoundError("No cached iv_filter.csv or closes_daily.csv available.")
 
-    daily = pd.read_csv(daily_path, index_col=0, parse_dates=True)
+    daily = fast_read(daily_path, log_label=daily_path.name)
     idx = pd.to_datetime(daily.index, utc=True)
     neutral = pd.DataFrame({
         "vix": 20.0,
@@ -156,7 +157,7 @@ print(f"VIX:   {len(vix)} daily bars  ({vix.index[0].date()} — {vix.index[-1].
 print(f"VIX9D: {len(vix9d.dropna())} daily bars\n")
 
 # ── Get current ATM IV for each ticker in our pairs ───────────────────────────
-pairs = pd.read_csv(DATA_DIR / "pairs_selected.csv")
+pairs = fast_read(DATA_DIR / "pairs_selected.csv", prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label="pairs_selected.csv")
 
 print("Fetching current ATM IV from option chains:")
 ticker_iv: dict[str, float] = {}

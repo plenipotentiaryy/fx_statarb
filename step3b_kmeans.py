@@ -23,6 +23,7 @@ import os
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from config import DATA_DIR, OUTPUT_DIR, DAILY_START, KMEANS_N_CLUSTERS, KMEANS_VOL_WINDOW
+from utils import fast_read
 
 REGIME_NAMES = {0: "Trend", 1: "Sideways", 2: "Panic"}
 FEATURE_TICKERS = ["SPY", "^VIX"]
@@ -33,7 +34,7 @@ FEATURE_TICKERS = ["SPY", "^VIX"]
 def load_macro_data() -> pd.DataFrame:
     local_path = DATA_DIR / "closes_daily.csv"
     if local_path.exists():
-        daily = pd.read_csv(local_path, index_col=0, parse_dates=True)
+        daily = fast_read(local_path, log_label=local_path.name)
         if "spxusd" in daily.columns:
             spy = daily["spxusd"].dropna()
             spy_ret = spy.pct_change()

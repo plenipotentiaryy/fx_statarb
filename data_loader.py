@@ -19,8 +19,9 @@ from pathlib import Path
 
 from config import (
     DATA_DIR, RTH_START, RTH_END, BAR_MINUTES,
-    CLOSES_FILE, VOLUMES_FILE, VWAPS_FILE,
+    CLOSES_FILE, VOLUMES_FILE, VWAPS_FILE, WFO_SKIP_VOLUMES,
 )
+from utils import fast_read
 
 CLOSES_PARQUET  = DATA_DIR / f"closes_{BAR_MINUTES}min.parquet"
 VOLUMES_PARQUET = DATA_DIR / f"volumes_{BAR_MINUTES}min.parquet"
@@ -33,19 +34,6 @@ _TZ = "UTC"
 
 
 # ── Core loader ───────────────────────────────────────────────────────────────
-
-def _load_parquet(path: Path, columns: list[str] | None) -> pd.DataFrame:
-    """Read Parquet with optional column pruning (pyarrow column-pushdown)."""
-    return pd.read_parquet(path, columns=columns, engine="pyarrow")
-
-
-def _load_csv(path: Path, columns: list[str] | None) -> pd.DataFrame:
-    df = pd.read_csv(path, index_col=0, parse_dates=True)
-    if columns:
-        keep = [c for c in columns if c in df.columns]
-        df = df[keep]
-    return df
-
 
 def _normalise_tz(df: pd.DataFrame) -> pd.DataFrame:
     if df.index.tz is None:
@@ -77,24 +65,16 @@ def _load(parquet_path: Path, csv_path: Path,
           end:     str | None,
           rth:     bool,
           freq:    str | None) -> pd.DataFrame:
-    if parquet_path.exists():
-        try:
-            df = _load_parquet(parquet_path, tickers)
-            df = _normalise_tz(df)
-            df = _apply_filters(df, start, end, rth, freq)
-            return df
-        except (ImportError, ModuleNotFoundError):
-            print(f"  [Loader] pyarrow not found, falling back to CSV: {csv_path.name}")
-        except Exception as e:
-            print(f"  [Loader] Parquet error, falling back to CSV: {e}")
-
-    if csv_path.exists():
-        df = _load_csv(csv_path, tickers)
-    else:
+    if not parquet_path.exists() and not csv_path.exists():
         raise FileNotFoundError(
             f"Neither {parquet_path} nor {csv_path} found. "
             "Run download_av.py to build the dataset."
         )
+    df = fast_read(
+        csv_path,
+        columns=tickers,
+        log_label=csv_path.name,
+    )
     df = _normalise_tz(df)
     df = _apply_filters(df, start, end, rth, freq)
     return df
@@ -128,6 +108,9 @@ def load_volumes(tickers: list[str] | None = None,
                  rth:     bool = True,
                  freq:    str | None = None) -> pd.DataFrame:
     """Load configured-bar volume data. Falls back to dummy volume (ones) if unavailable."""
+    if WFO_SKIP_VOLUMES:
+        print("  [Loader] WFO_SKIP_VOLUMES=True — skipping volume load.")
+        return None
     try:
         return _load(VOLUMES_PARQUET, VOLUMES_CSV, tickers, start, end, rth, freq)
     except FileNotFoundError:

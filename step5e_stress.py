@@ -26,6 +26,7 @@ from config import (
 )
 from filters import HurstFilter
 from step3j_wfo import check_coint_johansen, compute_half_life
+from utils import fast_read
 
 WINDOW_MONTHS  = 6    # walk-forward window size
 STEP_MONTHS    = 2    # how far each window advances
@@ -41,7 +42,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 def load_daily() -> pd.DataFrame:
     path = DATA_DIR / "closes_daily.csv"
     if not path.exists(): return None
-    df = pd.read_csv(path, index_col=0, parse_dates=True)
+    df = fast_read(path, log_label=path.name)
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index, utc=True)
     if df.index.tz is None:
@@ -54,7 +55,7 @@ def load_closes() -> pd.DataFrame:
     path = DATA_DIR / CLOSES_FILE
     if not path.exists():
         path = DATA_DIR / "closes_15min.csv"
-    df = pd.read_csv(path, index_col=0, parse_dates=True)
+    df = fast_read(path, log_label=path.name)
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index, utc=True)
     
@@ -69,7 +70,7 @@ def load_vix_daily() -> pd.Series | None:
     iv_path = DATA_DIR / "iv_filter.csv"
     if not iv_path.exists():
         return None
-    df = pd.read_csv(iv_path, index_col=0, parse_dates=True)
+    df = fast_read(iv_path, prefer_parquet=False, fast_bars=0, log_label=iv_path.name)
     if "vix" in df.columns:
         return df["vix"].dropna()
     return None
@@ -173,7 +174,7 @@ def metrics(trades: list[dict], days: float) -> dict:
 
 closes_all = load_closes()
 daily_all = load_daily()
-pairs      = pd.read_csv(DATA_DIR / "pairs_selected.csv")
+pairs = fast_read(DATA_DIR / "pairs_selected.csv", prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label="pairs_selected.csv")
 vix_daily  = load_vix_daily()
 
 if pairs.empty:
@@ -355,14 +356,14 @@ print(f"{'='*70}")
 mc_path = DATA_DIR / "ou_montecarlo_summary.csv"
 mc_conf: dict[str, float] = {}
 if mc_path.exists():
-    mc_df = pd.read_csv(mc_path)
+    mc_df = fast_read(mc_path, prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label=mc_path.name)
     for _, r in mc_df.iterrows():
         mc_conf[r["pair"]] = float(r["win_rate"]) / 100
 
 regimes_path = DATA_DIR / "regimes.csv"
 current_regime: dict[str, str] = {}
 if regimes_path.exists():
-    reg_df = pd.read_csv(regimes_path, index_col=0, parse_dates=True)
+    reg_df = fast_read(regimes_path, prefer_parquet=False, fast_bars=0, log_label=regimes_path.name)
     for col in reg_df.columns:
         last_val = reg_df[col].dropna().iloc[-1] if not reg_df[col].dropna().empty else 0
         current_regime[col] = "volatile" if last_val == 1 else "normal"

@@ -40,6 +40,7 @@ from config import (
 )
 from kalman import kalman_hedge
 from data_loader import load_volumes, load_vwaps
+from utils import fast_read
 
 ENTRY_Z_GRID = [1.9, 2.0, 2.2, 2.5, 3.0]   # raised floor; filters mean higher Z is viable
 STOP_Z_GRID  = [3.2, 3.5, 4.0]
@@ -262,13 +263,13 @@ def load_closes_split() -> tuple[pd.DataFrame, pd.DataFrame, float]:
     path = DATA_DIR / CLOSES_FILE
     if not path.exists():
         path = DATA_DIR / "closes_15min.csv"
-    closes = pd.read_csv(path, index_col=0, parse_dates=True)
+    closes = fast_read(path, log_label=path.name)
     closes.index = pd.to_datetime(closes.index, utc=True).tz_convert("US/Eastern")
     closes = closes.between_time(RTH_START, RTH_END)
 
     pairs_path = DATA_DIR / "pairs_selected.csv"
     if pairs_path.exists():
-        meta = pd.read_csv(pairs_path)
+        meta = fast_read(pairs_path, prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label=pairs_path.name)
         if not meta.empty:
             needed    = {t for p in meta["pair"] for t in p.split("-")}
             available = [t for t in needed if t in closes.columns]
@@ -463,7 +464,7 @@ def calc_metrics(trades: list[dict], days: float) -> dict | None:
 
 closes_train, closes_test, days_train = load_closes_split()
 days_test = (closes_test.index[-1] - closes_test.index[0]).days
-pairs = pd.read_csv(DATA_DIR / "pairs_selected.csv")
+pairs = fast_read(DATA_DIR / "pairs_selected.csv", prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label="pairs_selected.csv")
 
 if pairs.empty:
     raise SystemExit("pairs_selected.csv is empty — run step2_pairs.py first")

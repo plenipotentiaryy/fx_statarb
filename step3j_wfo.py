@@ -28,7 +28,6 @@ import argparse
 import itertools
 import numpy as np
 import pandas as pd
-import scipy.optimize as opt
 from sklearn.ensemble import HistGradientBoostingClassifier
 import matplotlib
 matplotlib.use("Agg")
@@ -40,7 +39,7 @@ import statsmodels.api as sm
 from config import (
     TAIL_HEDGE_DRAG_ANNUAL, TAIL_HEDGE_PAYOUT_MULT, INITIAL_CAPITAL,
     COST_MAKER, COST_TAKER, CIRCUIT_BREAKER_Z,
-    CLOSES_FILE, VOLUMES_FILE, BORROW_RATE_ANNUAL,
+    CLOSES_FILE, VOLUMES_FILE, VWAPS_FILE, BORROW_RATE_ANNUAL,
     RTH_START, RTH_END, SIGNAL_START,
     BARS_PER_DAY, DATA_DIR, OUTPUT_DIR,
     WFO_TRAIN_MONTHS, WFO_TEST_MONTHS, WFO_STEP_MONTHS, WFO_MIN_TRADES,
@@ -50,9 +49,30 @@ from config import (
     USE_RETURN_SPREAD, RETURN_WINDOW,
     USE_VELOCITY_GATE, VELOCITY_WINDOW,
     USE_RVOL_GATE, RVOL_THRESHOLD, RVOL_WINDOW,
-    USE_VWAP_MTF, VWAP_MTF_TF, KALMAN_DELTA
+    USE_VWAP_MTF, VWAP_MTF_TF, KALMAN_DELTA,
+    FAST_RUN_BARS, WFO_SKIP_VOLUMES,
 )
 from filters import HurstFilter, get_hurst_multiplier, validate_kde_density
+from tail_ev_profiler import TailAdjustedEVProfiler
+from regime_memory import RegimeMemoryWeighter
+from rmt_covariance import clean_covariance_rmt
+from portfolio_optimizer import RegularizedPortfolioOptimizer
+from utils import fast_read
+
+
+TAIL_ENTRY_Z_MIN = 2.0
+TAIL_STOP_Z = 4.0
+TAIL_EXIT_Z = 0.0
+TAIL_LABEL_LOOKAHEAD_BARS = BARS_PER_DAY * 30
+INNER_VALID_FRACTION = 0.25
+INNER_MIN_TRAIN_BARS = BARS_PER_DAY * 40
+INNER_MIN_VALID_BARS = BARS_PER_DAY * 10
+TAIL_THRESHOLD_GRID = [2.25, 2.5, 2.75]
+TAIL_RR_GRID = [0.4, 0.5, 0.6]
+TAIL_CONFIDENCE_LEVEL = 0.95
+TAIL_REFIT_FREQ = "W"
+LIMIT_REBATE_GRID = [0.03, 0.05]
+LIMIT_TTL_GRID = [2, 3]
 
 # Grid definition (same as grid.py)
 ENTRY_Z_GRID = [1.65, 1.7, 1.8, 2.0, 2.2]
@@ -244,6 +264,331 @@ def build_signals(closes, volumes, vwaps, t1, t2, beta, half_life):
         "spread_vwap_mtf": spread_vwap_mtf
     }).dropna().between_time(SIGNAL_START, RTH_END)
 
+
+def add_tail_ev_features(df: pd.DataFrame,
+                         hurst_window: int = 240,
+                         hurst_lag: int = 10,
+                         vol_window: int = 240) -> pd.DataFrame:
+    """Add vectorized TailAdjustedEVProfiler features to a signal frame."""
+    out = df.copy()
+    out["velocity"] = out["zscore"].diff(VELOCITY_WINDOW) if "velocity" not in out.columns else out["velocity"]
+
+    spread_std = out["spread_std"].replace(0, np.nan)
+    vol_baseline = spread_std.rolling(vol_window, min_periods=max(20, vol_window // 4)).median()
+    out["vol_ratio"] = (spread_std / vol_baseline.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+    out["vol_ratio"] = out["vol_ratio"].fillna(1.0).clip(lower=0.05, upper=20.0)
+
+    diff_1 = out["spread"].diff(1)
+    diff_tau = out["spread"].diff(hurst_lag)
+    var_1 = diff_1.rolling(window=hurst_window, min_periods=max(20, hurst_window // 3)).var()
+    var_tau = diff_tau.rolling(window=hurst_window, min_periods=max(20, hurst_window // 3)).var()
+    denom = np.log(hurst_lag)
+    hurst = 0.5 * np.log(var_tau / var_1.replace(0, np.nan)) / denom
+    out["hurst"] = hurst.replace([np.inf, -np.inf], np.nan).fillna(0.5).clip(lower=0.0, upper=1.0)
+    return out
+
+
+def add_regime_memory_state(
+    df: pd.DataFrame,
+    hmm_regime: pd.Series | None = None,
+    hl_window: int = 20,
+    hl_epsilon: float = 1e-6,
+) -> pd.DataFrame:
+    """Attach vectorized half-life and macro-state columns for regime-aware weighting."""
+    out = df.copy()
+
+    spread = pd.to_numeric(out["spread"], errors="coerce").astype(np.float64)
+    x_lag = spread.shift(1)
+    dx = spread.diff()
+    min_periods = max(5, hl_window // 2)
+    cov = dx.rolling(window=hl_window, min_periods=min_periods).cov(x_lag)
+    var = x_lag.rolling(window=hl_window, min_periods=min_periods).var()
+    b = cov / var.replace(0.0, np.nan)
+    theta = (-b).clip(lower=hl_epsilon)
+    half_life = (np.log(2.0) / theta).where(np.isfinite(theta), np.nan)
+    half_life = half_life.ffill().bfill()
+    if half_life.isna().any():
+        fallback_hl = float(np.log(2.0) / hl_epsilon)
+        half_life = half_life.fillna(fallback_hl)
+    out["half_life"] = half_life.clip(lower=1.0, upper=10_000.0)
+
+    if "hmm_regime" in out.columns:
+        regime = out["hmm_regime"]
+    elif hmm_regime is not None and isinstance(out.index, pd.DatetimeIndex):
+        regime_source = pd.Series(hmm_regime).sort_index().copy()
+        regime_source.index = pd.to_datetime(regime_source.index).tz_localize(None)
+        lookup_index = out.index.tz_localize(None) if out.index.tz is not None else out.index
+        regime = regime_source.reindex(lookup_index, method="ffill")
+        regime.index = out.index
+    else:
+        regime = pd.Series(0, index=out.index, dtype=np.int64)
+
+    regime = regime.ffill().bfill()
+    out["hmm_regime"] = regime
+    out["macro_state"] = regime.astype("string").fillna("unknown")
+    return out
+
+
+def _next_event_index(event_idx: np.ndarray, query_idx: np.ndarray) -> np.ndarray:
+    """Vectorized next-event lookup using searchsorted."""
+    if event_idx.size == 0 or query_idx.size == 0:
+        return np.full(query_idx.shape, np.iinfo(np.int64).max, dtype=np.int64)
+    pos = np.searchsorted(event_idx, query_idx + 1, side="left")
+    out = np.full(query_idx.shape, np.iinfo(np.int64).max, dtype=np.int64)
+    valid = pos < event_idx.size
+    out[valid] = event_idx[pos[valid]]
+    return out
+
+
+def build_tail_training_frame(
+    train_df: pd.DataFrame,
+    entry_z_min: float = TAIL_ENTRY_Z_MIN,
+    exit_z: float = TAIL_EXIT_Z,
+    stop_z: float = TAIL_STOP_Z,
+    lookahead_bars: int = TAIL_LABEL_LOOKAHEAD_BARS,
+) -> pd.DataFrame:
+    """
+    Build strictly in-sample EVT labels for train_df.
+
+    The last `lookahead_bars` rows are dropped to prevent OOS leakage.
+    Labeling is vectorized with event-index search; no row-wise loops.
+    """
+    if len(train_df) <= lookahead_bars + 1:
+        return pd.DataFrame(columns=list(train_df.columns) + ["revert_label", "expected_gain", "tail_loss"])
+
+    core = train_df.iloc[:-lookahead_bars].copy()
+    z = train_df["zscore"].to_numpy(dtype=np.float64)
+    n_core = len(core)
+    idx = np.arange(n_core, dtype=np.int64)
+
+    long_mask = z[:n_core] <= -entry_z_min
+    short_mask = z[:n_core] >= entry_z_min
+    candidate_mask = long_mask | short_mask
+
+    tp_long_all = np.flatnonzero(z >= exit_z)
+    sl_long_all = np.flatnonzero(z <= -stop_z)
+    tp_short_all = np.flatnonzero(z <= -exit_z)
+    sl_short_all = np.flatnonzero(z >= stop_z)
+
+    next_tp_long = _next_event_index(tp_long_all, idx[long_mask])
+    next_sl_long = _next_event_index(sl_long_all, idx[long_mask])
+    next_tp_short = _next_event_index(tp_short_all, idx[short_mask])
+    next_sl_short = _next_event_index(sl_short_all, idx[short_mask])
+
+    label = np.zeros(n_core, dtype=np.int8)
+    long_horizon = idx[long_mask] + lookahead_bars
+    short_horizon = idx[short_mask] + lookahead_bars
+
+    long_revert = (next_tp_long < next_sl_long) & (next_tp_long <= long_horizon)
+    short_revert = (next_tp_short < next_sl_short) & (next_tp_short <= short_horizon)
+    label[idx[long_mask][long_revert]] = 1
+    label[idx[short_mask][short_revert]] = 1
+
+    core["revert_label"] = label
+    core["expected_gain"] = np.maximum(np.abs(core["zscore"].to_numpy(dtype=np.float64)) - abs(exit_z), 0.0)
+    core["tail_loss"] = np.abs(core["zscore"].to_numpy(dtype=np.float64))
+    core = core.loc[candidate_mask].copy()
+    return core.replace([np.inf, -np.inf], np.nan).dropna(
+        subset=["zscore", "velocity", "vol_ratio", "hurst", "revert_label", "expected_gain", "tail_loss"]
+    )
+
+
+def fit_and_score_tail_ev(
+    train_df: pd.DataFrame,
+    oos_df: pd.DataFrame,
+    hmm_regime: pd.Series | None = None,
+    tail_threshold: float = 2.5,
+    confidence_level: float = 0.95,
+    rr_threshold: float = 0.5,
+    tail_refit_freq: str = "W",
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None, TailAdjustedEVProfiler | None]:
+    """
+    Fit TailAdjustedEVProfiler on a strictly in-sample labeled train slice and
+    score both train/OOS frames. Returns (scored_train, scored_oos, profiler).
+    """
+    train_feat = add_regime_memory_state(
+        add_tail_ev_features(train_df),
+        hmm_regime=hmm_regime,
+    )
+    oos_feat = add_regime_memory_state(
+        add_tail_ev_features(oos_df),
+        hmm_regime=hmm_regime,
+    )
+    tail_train = build_tail_training_frame(train_feat)
+    if tail_train.empty:
+        return None, None, None
+
+    profiler = TailAdjustedEVProfiler(
+        tail_threshold=tail_threshold,
+        confidence_level=confidence_level,
+        rr_threshold=rr_threshold,
+        tail_refit_freq=tail_refit_freq,
+        gain_col="expected_gain",
+    )
+
+    try:
+        hl_now = float(train_feat["half_life"].iloc[-1])
+        state_now = train_feat["macro_state"].iloc[-1]
+        weighter = RegimeMemoryWeighter(age_lambda=0.02, hl_gamma=1.0)
+        weights = weighter.compute_weights(
+            df=tail_train,
+            now_index=train_feat.index[-1],
+            hl_now=hl_now,
+            state_now=state_now,
+        )
+        profiler.fit(tail_train, sample_weights=weights)
+        scored_train = profiler.predict_ev(train_feat)
+        scored_oos = profiler.predict_ev(oos_feat)
+    except (ValueError, KeyError, RuntimeError):
+        return None, None, None
+    return scored_train, scored_oos, profiler
+
+
+def split_inner_train_valid(
+    df: pd.DataFrame,
+    valid_fraction: float = INNER_VALID_FRACTION,
+    min_train_bars: int = INNER_MIN_TRAIN_BARS,
+    min_valid_bars: int = INNER_MIN_VALID_BARS,
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    """Chronological split used by nested WFO to keep parameter tuning leak-free."""
+    if df is None or len(df) < (min_train_bars + min_valid_bars):
+        return None, None
+    split_at = int(round(len(df) * (1.0 - valid_fraction)))
+    split_at = max(min_train_bars, min(split_at, len(df) - min_valid_bars))
+    if split_at <= 0 or split_at >= len(df):
+        return None, None
+    return df.iloc[:split_at].copy(), df.iloc[split_at:].copy()
+
+
+def _trade_summary(trades: list[dict]) -> dict[str, float]:
+    if not trades:
+        return {
+            "sharpe": -np.inf,
+            "total_pnl": 0.0,
+            "trades": 0,
+            "win_rate": 0.0,
+            "avg_pnl": 0.0,
+        }
+    pnl = pd.Series([float(t.get("net_pnl", 0.0)) for t in trades], dtype=np.float64)
+    std = float(pnl.std(ddof=1)) if len(pnl) > 1 else 0.0
+    sharpe = float(pnl.mean() / std * np.sqrt(len(pnl))) if std > 1e-12 else float("-inf")
+    return {
+        "sharpe": sharpe,
+        "total_pnl": float(pnl.sum()),
+        "trades": int(len(pnl)),
+        "win_rate": float((pnl > 0).mean()),
+        "avg_pnl": float(pnl.mean()),
+    }
+
+
+def select_nested_wfo_params(
+    pair_name: str,
+    sig_train: pd.DataFrame,
+    t1: str,
+    t2: str,
+    beta: float,
+    hmm_regime: pd.Series | None = None,
+    z_profile: dict | None = None,
+    use_hurst: bool = False,
+    spread_daily: pd.Series | None = None,
+    session_window: dict | None = None,
+) -> dict | None:
+    """
+    Inner WFO selector.
+
+    Tunes tail-EV configuration, entry/exit/stop thresholds, and limit-order
+    execution knobs on an inner train/validation split only.
+    """
+    inner_train, inner_valid = split_inner_train_valid(sig_train)
+    if inner_train is None or inner_valid is None:
+        return None
+
+    best_choice = None
+    valid_days = max(int(inner_valid.index.normalize().nunique()), 1)
+    train_days = max(int(inner_train.index.normalize().nunique()), 1)
+    candidate_sources: list[tuple[str, dict]] = []
+
+    if z_profile is not None:
+        candidate_sources.append((
+            "EV-profile",
+            {
+                "entry_z": float(z_profile["entry_z"]),
+                "exit_z": float(z_profile["exit_z"]),
+                "stop_z": float(z_profile["stop_z"]),
+            },
+        ))
+
+    for tail_threshold in TAIL_THRESHOLD_GRID:
+        for rr_threshold in TAIL_RR_GRID:
+            scored_inner_train, scored_inner_valid, profiler = fit_and_score_tail_ev(
+                inner_train,
+                inner_valid,
+                hmm_regime=hmm_regime,
+                tail_threshold=tail_threshold,
+                confidence_level=TAIL_CONFIDENCE_LEVEL,
+                rr_threshold=rr_threshold,
+                tail_refit_freq=TAIL_REFIT_FREQ,
+            )
+            if scored_inner_train is None or scored_inner_valid is None or profiler is None:
+                continue
+
+            candidates = list(candidate_sources)
+            grid_choice = run_grid(scored_inner_train, t1, t2, beta, COMBOS, train_days)
+            if grid_choice is not None:
+                candidates.append(("grid", grid_choice))
+            if not candidates:
+                continue
+
+            for source_name, params in candidates:
+                for limit_rebate in LIMIT_REBATE_GRID:
+                    for limit_ttl in LIMIT_TTL_GRID:
+                        pair_hurst_f = HurstFilter() if use_hurst else None
+                        valid_trades, _, _ = backtest_oos(
+                            scored_inner_valid,
+                            t1,
+                            t2,
+                            beta,
+                            float(params["entry_z"]),
+                            float(params["exit_z"]),
+                            float(params["stop_z"]),
+                            hmm_regime=hmm_regime,
+                            hurst_filter=pair_hurst_f,
+                            spread_daily=spread_daily,
+                            limit_rebate=float(limit_rebate),
+                            limit_ttl=int(limit_ttl),
+                            session_window=session_window,
+                        )
+                        summary = _trade_summary(valid_trades)
+                        if summary["trades"] < max(3, min(WFO_MIN_TRADES, valid_days // 5)):
+                            continue
+
+                        score = (
+                            summary["sharpe"],
+                            summary["total_pnl"],
+                            float(scored_inner_valid["tail_signal_ok"].mean()) if "tail_signal_ok" in scored_inner_valid.columns else 0.0,
+                        )
+                        if best_choice is None or score > best_choice["score"]:
+                            best_choice = {
+                                "pair": pair_name,
+                                "entry_z": float(params["entry_z"]),
+                                "exit_z": float(params["exit_z"]),
+                                "stop_z": float(params["stop_z"]),
+                                "limit_rebate": float(limit_rebate),
+                                "limit_ttl": int(limit_ttl),
+                                "tail_threshold": float(tail_threshold),
+                                "rr_threshold": float(rr_threshold),
+                                "confidence_level": float(TAIL_CONFIDENCE_LEVEL),
+                                "tail_refit_freq": TAIL_REFIT_FREQ,
+                                "source": source_name,
+                                "inner_valid_sharpe": summary["sharpe"],
+                                "inner_valid_pnl": summary["total_pnl"],
+                                "inner_valid_trades": summary["trades"],
+                                "inner_valid_win_rate": summary["win_rate"],
+                                "inner_tail_gate_pass_rate": float(scored_inner_valid["tail_signal_ok"].mean()) if "tail_signal_ok" in scored_inner_valid.columns else 0.0,
+                                "score": score,
+                            }
+    return best_choice
+
 # ── Dynamic Cointegration ────────────────────────────────────────────────────
 
 _JOH_CRIT_IDX = {0.90: 0, 0.95: 1, 0.99: 2}
@@ -295,6 +640,14 @@ def backtest_oos(df, t1, t2, beta, entry_z, exit_z, stop_z,
     limit_z = 0.0
     pending_h_mult = 1.0
     current_h_mult = 1.0
+    pending_tail_ev = np.nan
+    pending_tail_es = np.nan
+    pending_p_revert = np.nan
+    pending_tail_ok = False
+    e_tail_ev = np.nan
+    e_tail_es = np.nan
+    e_p_revert = np.nan
+    e_tail_ok = False
 
     for i in range(len(df)):
         if pair_blocked: continue
@@ -338,6 +691,10 @@ def backtest_oos(df, t1, t2, beta, entry_z, exit_z, stop_z,
                     "gross_pnl":  round(gross, 4),
                     "tx_cost":    round(tx, 4),
                     "borrow_cost": round(brw, 4),
+                    "tail_ev":    round(float(e_tail_ev), 6) if pd.notna(e_tail_ev) else np.nan,
+                    "tail_es_95": round(float(e_tail_es), 6) if pd.notna(e_tail_es) else np.nan,
+                    "p_revert":   round(float(e_p_revert), 6) if pd.notna(e_p_revert) else np.nan,
+                    "tail_signal_ok": bool(e_tail_ok),
                     "features":   e_features if 'e_features' in locals() else [abs(z), vr, entry_std, df.index[i].hour + df.index[i].minute / 60.0]
                 })
                 pos = 0
@@ -354,6 +711,10 @@ def backtest_oos(df, t1, t2, beta, entry_z, exit_z, stop_z,
                 es = s; et1 = p1; et2 = p2; ebar = i
                 entry_sma = df["spread_mean"].iloc[i]
                 entry_std = df["spread_std"].iloc[i]
+                e_tail_ev = pending_tail_ev
+                e_tail_es = pending_tail_es
+                e_p_revert = pending_p_revert
+                e_tail_ok = pending_tail_ok
                 e_features = [abs(z), vr, entry_std, df.index[i].hour + df.index[i].minute / 60.0]
             elif pending_ttl <= 0:
                 pending_pos = 0
@@ -379,6 +740,10 @@ def backtest_oos(df, t1, t2, beta, entry_z, exit_z, stop_z,
                 if not is_in:
                     continue
 
+            tail_signal_ok = bool(df["tail_signal_ok"].iloc[i]) if "tail_signal_ok" in df.columns else False
+            if not tail_signal_ok:
+                continue
+
             detect_long = z < -entry_z
             detect_short = z > entry_z
             
@@ -396,7 +761,7 @@ def backtest_oos(df, t1, t2, beta, entry_z, exit_z, stop_z,
                     d_prev = (df.index[i] - pd.Timedelta(days=1)).normalize()
                     h_tail_daily = spread_daily.loc[:d_prev].tail(HURST_ENTRY_WINDOW - 1)
                     h_tail = pd.concat([h_tail_daily, pd.Series({df.index[i]: df["spread"].iloc[i]})])
-                    h_blocked, h_val = hurst_filter.should_block(h_tail, df.index[i])
+                    h_blocked, h_val, _ = hurst_filter.should_block(h_tail, df.index[i])
                     if h_blocked:
                         hurst_blocked += 1
                         continue
@@ -405,46 +770,62 @@ def backtest_oos(df, t1, t2, beta, entry_z, exit_z, stop_z,
                 pending_ttl = limit_ttl
                 limit_z = (-entry_z + limit_rebate) if detect_long else (entry_z - limit_rebate)
                 pending_h_mult = get_hurst_multiplier(h_val)
+                pending_tail_ev = df["tail_ev"].iloc[i] if "tail_ev" in df.columns else np.nan
+                pending_tail_es = df["tail_es_95"].iloc[i] if "tail_es_95" in df.columns else np.nan
+                pending_p_revert = df["p_revert"].iloc[i] if "p_revert" in df.columns else np.nan
+                pending_tail_ok = tail_signal_ok
 
     # Note: current_h_mult is used inside the loop at exit to scale 'final_pnl'
     return trades, hmm_blocked, hurst_blocked
 
 
-def optimize_portfolio_weights(returns_df: pd.DataFrame, target_return: float = 0.10, max_weight: float = 0.20) -> dict:
+def optimize_portfolio_weights(
+    returns_df: pd.DataFrame,
+    ev_vector: pd.Series | None = None,
+    current_weights: pd.Series | dict[str, float] | None = None,
+) -> dict[str, float]:
     """
-    V9: Mean-Variance Optimization with Target Return constraint (μ_target).
+    RMT-cleaned, regularized convex allocation.
+
     returns_df: rows=dates, columns=pairs, values=daily PnL.
+    ev_vector: expected value per pair, typically TailAdjustedEVProfiler output.
     """
     if returns_df.empty or returns_df.shape[1] == 0:
         return {}
-    if returns_df.shape[1] == 1:
-        return {returns_df.columns[0]: 1.0}
-        
-    mu = returns_df.mean().values
-    Sigma = returns_df.cov().values
-    n = len(mu)
-    target_daily = target_return / 252.0
-    
-    def portfolio_variance(w, S):
-        return np.dot(w.T, np.dot(S, w))
-        
-    init_w = np.full(n, 1.0 / n)
-    bounds = tuple((0.0, max_weight) for _ in range(n))
-    constraints = [
-        {'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0},
-        {'type': 'ineq', 'fun': lambda w: np.sum(mu * w) - target_daily}
-    ]
-    
-    res = opt.minimize(portfolio_variance, init_w, args=(Sigma,), method='SLSQP', bounds=bounds, constraints=constraints)
-    if not res.success:
-        # Fallback to Min-Variance if target unreachable
-        res = opt.minimize(portfolio_variance, init_w, args=(Sigma,), method='SLSQP', bounds=bounds, 
-                           constraints=[{'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0}])
-        
-    weights = res.x
-    weights[weights < 1e-4] = 0.0
-    weights /= np.sum(weights)
-    return {col: float(w) for col, w in zip(returns_df.columns, weights)}
+
+    returns_df = returns_df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    active_cols = returns_df.columns.tolist()
+
+    if ev_vector is None:
+        ev_vector = returns_df.mean()
+    else:
+        ev_vector = pd.Series(ev_vector, dtype=np.float64).reindex(active_cols).fillna(0.0)
+
+    if current_weights is None:
+        current_weights = pd.Series(0.0, index=active_cols)
+    else:
+        current_weights = pd.Series(current_weights, dtype=np.float64).reindex(active_cols).fillna(0.0)
+
+    try:
+        cov_clean = clean_covariance_rmt(returns_df)
+        optimizer = RegularizedPortfolioOptimizer(
+            eta=1.0,
+            tau=0.05,
+            gamma=0.02,
+            max_gross=2.0,
+            weight_min=-0.15,
+            weight_max=0.15,
+            market_neutral=True,
+        )
+        weights = optimizer.optimize_weights(
+            ev_vector=ev_vector,
+            cov_matrix=cov_clean,
+            current_weights=current_weights,
+        )
+        return pd.Series(weights, index=active_cols, dtype=np.float64).to_dict()
+    except Exception:
+        # Keep the book stable if allocation math fails; execution filters still run.
+        return current_weights.to_dict()
 
 def calculate_systemic_risk_scaler(returns_df: pd.DataFrame, threshold: float = 0.7) -> float:
     """
@@ -480,24 +861,26 @@ def _trades_to_daily_pnl(trades: list, dates: pd.DatetimeIndex) -> pd.Series:
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 
-def load_closes():
+def load_closes(selected_tickers: list[str] | None = None):
     path = DATA_DIR / CLOSES_FILE
     if not path.exists():
         path = DATA_DIR / "closes_15min.csv"
-    closes = pd.read_csv(path, index_col=0)
+    closes = fast_read(path, columns=selected_tickers, log_label=path.name)
     closes.index = pd.to_datetime(closes.index, utc=True)
     closes = closes.between_time(RTH_START, RTH_END)
     
     vol_path = DATA_DIR / VOLUMES_FILE
     volumes = None
-    if vol_path.exists():
-        volumes = pd.read_csv(vol_path, index_col=0)
+    if WFO_SKIP_VOLUMES:
+        print("WFO_SKIP_VOLUMES=True — skipping volumes CSV. Volume filters will be bypassed.")
+    elif vol_path.exists():
+        volumes = fast_read(vol_path, columns=closes.columns.tolist(), log_label=vol_path.name)
         volumes.index = pd.to_datetime(volumes.index, utc=True)
         volumes = volumes.reindex(closes.index).fillna(0.0)
 
     daily_path = DATA_DIR / "closes_daily.csv"
     if daily_path.exists():
-        daily = pd.read_csv(daily_path, index_col=0)
+        daily = fast_read(daily_path, columns=closes.columns.tolist(), log_label=daily_path.name)
         daily.index = pd.to_datetime(daily.index, utc=True)
     else:
         daily = None
@@ -505,7 +888,7 @@ def load_closes():
     vwap_path = DATA_DIR / VWAPS_FILE
     vwaps = None
     if vwap_path.exists():
-        vwaps = pd.read_csv(vwap_path, index_col=0)
+        vwaps = fast_read(vwap_path, columns=closes.columns.tolist(), log_label=vwap_path.name)
         vwaps.index = pd.to_datetime(vwaps.index, utc=True)
         vwaps = vwaps.reindex(closes.index).ffill()
 
@@ -550,7 +933,7 @@ def load_global_hmm() -> pd.Series | None:
     path = DATA_DIR / "global_hmm_regime.csv"
     if not path.exists():
         return None
-    s = pd.read_csv(path, index_col=0, parse_dates=True).iloc[:, 0]
+    s = fast_read(path, prefer_parquet=False, fast_bars=0, log_label=path.name).iloc[:, 0]
     s.index = pd.to_datetime(s.index).tz_localize(None)
     return s.rename("global_hmm")
 
@@ -577,7 +960,24 @@ def main():
 
     use_expanding = (not args.rolling) and WFO_EXPANDING
 
-    closes, daily, volumes, vwaps = load_closes()
+    preloaded_pairs = None
+    selected_tickers = None
+    if not args.full_universe:
+        pairs_file = DATA_DIR / args.pairs
+        if not pairs_file.exists():
+            raise SystemExit(f"Pairs file {pairs_file} not found.")
+        preloaded_pairs = fast_read(
+            pairs_file,
+            prefer_parquet=False,
+            fast_bars=0,
+            index_col=None,
+            parse_dates=False,
+            log_label=pairs_file.name,
+        )
+        if not preloaded_pairs.empty and "pair" in preloaded_pairs.columns:
+            selected_tickers = sorted({t for p in preloaded_pairs["pair"] for t in str(p).split("-")})
+
+    closes, daily, volumes, vwaps = load_closes(selected_tickers=selected_tickers)
     if args.full_universe:
         from itertools import combinations
         ticker_list = sorted(daily.columns.tolist())
@@ -585,10 +985,7 @@ def main():
         pairs = pd.DataFrame({"pair": [f"{t1}-{t2}" for t1, t2 in combos]})
         print(f"Full Universe enabled: generated {len(pairs)} pair combinations.")
     else:
-        pairs_file = DATA_DIR / args.pairs
-        if not pairs_file.exists():
-            raise SystemExit(f"Pairs file {pairs_file} not found.")
-        pairs  = pd.read_csv(pairs_file)
+        pairs = preloaded_pairs
 
     if pairs.empty:
         raise SystemExit("No pairs to process.")
@@ -599,7 +996,7 @@ def main():
     _z_profiles: dict[str, dict] = {}
     _zp_path = DATA_DIR / "z_profiles.csv"
     if _zp_path.exists():
-        _zp_df = pd.read_csv(_zp_path)
+        _zp_df = fast_read(_zp_path, prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label=_zp_path.name)
         for _, _r in _zp_df[_zp_df["tradeable"] == True].iterrows():
             _z_profiles[_r["pair"]] = {
                 "entry_z": float(_r["entry_z"]),
@@ -667,7 +1064,7 @@ def main():
     sessions = {}
     sess_path = DATA_DIR / "pair_sessions.csv"
     if sess_path.exists():
-        _sess_df = pd.read_csv(sess_path)
+        _sess_df = fast_read(sess_path, prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label=sess_path.name)
         sessions = _sess_df.set_index("pair").to_dict(orient="index")
         print(f"Session profiles loaded for {len(sessions)} pairs")
 
@@ -675,6 +1072,7 @@ def main():
     wfo_params     = []   # best params log per pair per window
     total_hmm_blocked   = 0 # count of entries blocked by Macro-HMM
     total_hurst_blocked = 0 # count of entries blocked by Hurst drift guard
+    current_portfolio_weights: dict[str, float] = {}
 
     for w_idx, (tr_s, tr_e, te_s, te_e) in enumerate(windows):
         tr_s_ts = pd.Timestamp(tr_s, tz="UTC")
@@ -709,7 +1107,9 @@ def main():
         window_hmm_blocks = 0
         window_hurst_blocks = 0
         window_best = {}
+        window_scored_test = {}
         optimal_weights = {}
+        rebalance_deltas = pd.Series(dtype=np.float64)
         window_best       = {}
         optimal_weights   = {}
 
@@ -744,23 +1144,33 @@ def main():
             if len(sig_train) < 100 or len(sig_test) < 20:
                 continue
 
-            # 4. Get entry params — prefer EV-optimal profile, fall back to grid
-            if pair_name in _z_profiles:
-                zp = _z_profiles[pair_name]
-                best = {
-                    "entry_z": zp["entry_z"],
-                    "exit_z":  zp["exit_z"],
-                    "stop_z":  zp["stop_z"],
-                    "sharpe":  zp["ev"],    # EV stands in for sharpe in the log
-                    "trades":  0,
-                    "win_rate": 0.0,
-                    "total_pnl": 0.0,
-                }
-                source = "EV-profile"
-            else:
-                best = run_grid(sig_train, t1, t2, dynamic_beta, COMBOS, days_train)
-                source = "grid"
+            pair_session = sessions.get(pair_name)
+            spread_daily_full = (daily[t1] - dynamic_beta * daily[t2]).dropna() if use_hurst else None
+            best = select_nested_wfo_params(
+                pair_name=pair_name,
+                sig_train=sig_train,
+                t1=t1,
+                t2=t2,
+                beta=dynamic_beta,
+                hmm_regime=global_hmm,
+                z_profile=_z_profiles.get(pair_name),
+                use_hurst=use_hurst,
+                spread_daily=spread_daily_full,
+                session_window=pair_session,
+            )
             if best is None:
+                continue
+
+            scored_train, scored_test, profiler = fit_and_score_tail_ev(
+                sig_train,
+                sig_test,
+                hmm_regime=global_hmm,
+                tail_threshold=best["tail_threshold"],
+                confidence_level=best["confidence_level"],
+                rr_threshold=best["rr_threshold"],
+                tail_refit_freq=best["tail_refit_freq"],
+            )
+            if scored_train is None or scored_test is None or profiler is None:
                 continue
 
             # ── KDE Structural Filter (Quality Check) ─────────────
@@ -772,16 +1182,17 @@ def main():
 
             # 5. Trade OOS with the best params found on TRAIN
             pair_hurst_f = HurstFilter() if use_hurst else None
-            spread_daily_full = (daily[t1] - dynamic_beta * daily[t2]).dropna() if use_hurst else None
 
             # ── ML Model Training (Train Trades) ─────────────
             train_trades, _, _ = backtest_oos(
-                sig_train, t1, t2, dynamic_beta,
+                scored_train, t1, t2, dynamic_beta,
                 best["entry_z"], best["exit_z"], best["stop_z"],
                 hmm_regime=global_hmm,
                 hurst_filter=pair_hurst_f,
                 spread_daily=spread_daily_full,
-                session_window=sessions.get(pair_name)
+                limit_rebate=best["limit_rebate"],
+                limit_ttl=best["limit_ttl"],
+                session_window=pair_session,
             )
             best["ml_model"] = None
             if len(train_trades) >= 20:
@@ -796,45 +1207,69 @@ def main():
             # Save for MVO calculation
             best["dynamic_beta"] = dynamic_beta
             best["dynamic_hl"] = dynamic_hl
-            best["source"] = source
+            best["train_sharpe"] = best.get("inner_valid_sharpe", float("nan"))
             best["train_returns"] = _trades_to_daily_pnl(train_trades, daily_train.index)
+            best["tail_gate_pass_rate_train"] = float(scored_train["tail_signal_ok"].mean()) if "tail_signal_ok" in scored_train.columns else 0.0
+            best["tail_ev_mean_train"] = float(scored_train["tail_ev"].mean()) if "tail_ev" in scored_train.columns else np.nan
             window_best[pair_name] = best
+            window_scored_test[pair_name] = scored_test
             
         # ── 6. Portfolio Optimization (MVO) ───────────
         active_pairs = list(window_best.keys())
         if active_pairs:
             train_returns_df = pd.DataFrame({p: window_best[p]["train_returns"] for p in active_pairs}).fillna(0)
-            optimal_weights = optimize_portfolio_weights(train_returns_df, target_return=0.10)
+            ev_vector = pd.Series(
+                {p: window_best[p].get("tail_ev_mean_train", np.nan) for p in active_pairs},
+                dtype=np.float64,
+            ).replace([np.inf, -np.inf], np.nan).fillna(train_returns_df.mean())
+            current_weights = pd.Series(current_portfolio_weights, dtype=np.float64).reindex(active_pairs).fillna(0.0)
+            target_weights = pd.Series(
+                optimize_portfolio_weights(
+                    returns_df=train_returns_df,
+                    ev_vector=ev_vector,
+                    current_weights=current_weights,
+                ),
+                dtype=np.float64,
+            ).reindex(active_pairs).fillna(0.0)
+            rebalance_deltas = target_weights - current_weights
+            optimal_weights = target_weights.to_dict()
             
             # --- Module 4: Tail Risk Guard ---
             sys_scaler = calculate_systemic_risk_scaler(train_returns_df, threshold=0.7)
             if sys_scaler < 1.0:
                 print(f"  [TAIL RISK] Absorption Ratio spike ({sys_scaler:.2f}). Scaling risk.")
-                for p in optimal_weights:
-                    optimal_weights[p] *= sys_scaler
+                target_weights *= sys_scaler
+                rebalance_deltas = target_weights - current_weights
+                optimal_weights = target_weights.to_dict()
+            current_portfolio_weights.update(optimal_weights)
         else:
             optimal_weights = {}
+            rebalance_deltas = pd.Series(dtype=np.float64)
 
         # ── 7. OOS Execution (Second Pass with Weights) ───────────
         for pair_name in active_pairs:
             t1, t2 = pair_name.split("-")
             best = window_best[pair_name]
             weight = optimal_weights.get(pair_name, 0.0)
-            if weight <= 0: continue
+            execution_weight = abs(weight)
+            if execution_weight <= 0: continue
 
-            # Re-build sig_test (or use cached if memory allowed, but for simplicity we rebuild)
-            sig_test = build_signals(closes_test, volumes, vwaps, t1, t2, best["dynamic_beta"], best["dynamic_hl"])
+            scored_test = window_scored_test.get(pair_name)
+            if scored_test is None or len(scored_test) < 20:
+                continue
             
             pair_hurst_f = HurstFilter() if use_hurst else None
             spread_daily_full = (daily[t1] - best["dynamic_beta"] * daily[t2]).dropna() if use_hurst else None
             
             oos_trades, pair_hmm_blocked, pair_hurst_blocked = backtest_oos(
-                sig_test, t1, t2, best["dynamic_beta"],
+                scored_test, t1, t2, best["dynamic_beta"],
                 best["entry_z"], best["exit_z"], best["stop_z"],
                 hmm_regime=global_hmm,
                 hurst_filter=pair_hurst_f,
                 spread_daily=spread_daily_full,
-                session_window=sessions.get(pair_name)
+                limit_rebate=best["limit_rebate"],
+                limit_ttl=best["limit_ttl"],
+                session_window=sessions.get(pair_name),
             )
             window_hmm_blocks += pair_hmm_blocked
             window_hurst_blocks += pair_hurst_blocked
@@ -851,10 +1286,13 @@ def main():
                     ml_mult = max(0.0, 2.0 * (prob - 0.5))
                 
                 # Apply Portfolio Weight AND ML Multiplier
-                final_size = weight * ml_mult
+                final_size = execution_weight * ml_mult
                 t["net_pnl"] *= final_size
                 t["gross_pnl"] *= final_size
                 t["tx_cost"] *= final_size
+                t["target_weight"] = weight
+                t["execution_weight"] = execution_weight
+                t["rebalance_delta"] = float(rebalance_deltas.get(pair_name, 0.0))
 
             # Filter out 0 size trades
             oos_trades = [t for t in oos_trades if t["net_pnl"] != 0 or t["tx_cost"] != 0]
@@ -887,10 +1325,19 @@ def main():
                 "entry_z":     best["entry_z"],
                 "exit_z":      best["exit_z"],
                 "stop_z":      best["stop_z"],
-                "train_sharpe": best["sharpe"],
+                "train_sharpe": round(best.get("train_sharpe", np.nan), 3) if pd.notna(best.get("train_sharpe", np.nan)) else np.nan,
                 "oos_sharpe":  round(oos_sh, 3),
                 "oos_trades":  len(oos_trades),
                 "oos_pnl":     round(oos_pnl, 4),
+                "limit_rebate": round(best.get("limit_rebate", np.nan), 4) if pd.notna(best.get("limit_rebate", np.nan)) else np.nan,
+                "limit_ttl": int(best.get("limit_ttl", 0)),
+                "tail_threshold": round(best.get("tail_threshold", np.nan), 4) if pd.notna(best.get("tail_threshold", np.nan)) else np.nan,
+                "rr_threshold": round(best.get("rr_threshold", np.nan), 4) if pd.notna(best.get("rr_threshold", np.nan)) else np.nan,
+                "inner_valid_trades": int(best.get("inner_valid_trades", 0)),
+                "tail_gate_pass_rate_train": round(best.get("tail_gate_pass_rate_train", 0.0), 4),
+                "tail_gate_pass_rate_oos": round(float(scored_test["tail_signal_ok"].mean()), 4) if "tail_signal_ok" in scored_test.columns else 0.0,
+                "tail_ev_mean_train": round(best.get("tail_ev_mean_train", np.nan), 6) if pd.notna(best.get("tail_ev_mean_train", np.nan)) else np.nan,
+                "tail_ev_mean_oos": round(float(scored_test["tail_ev"].mean()), 6) if "tail_ev" in scored_test.columns else np.nan,
             })
 
             window_oos_pnl += oos_pnl

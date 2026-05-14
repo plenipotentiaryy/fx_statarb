@@ -22,6 +22,7 @@ from config import (
     CLOSES_FILE, VOLUMES_FILE, VWAPS_FILE,
     RTH_START, RTH_END,
 )
+from utils import fast_read, save_with_parquet
 
 load_dotenv()
 
@@ -93,7 +94,7 @@ closes_path = DATA_DIR / CLOSES_FILE
 existing_closes: pd.DataFrame | None = None
 
 if closes_path.exists():
-    existing_closes = pd.read_csv(closes_path, index_col=0, parse_dates=True)
+    existing_closes = fast_read(closes_path, fast_bars=0, log_label=closes_path.name)
     if existing_closes.index.tz is None:
         existing_closes.index = existing_closes.index.tz_localize("UTC")
 
@@ -211,7 +212,7 @@ if all_data:
         (VWAPS_FILE,   "vwap"),
     ]:
         path = DATA_DIR / filename
-        base = pd.read_csv(path, index_col=0, parse_dates=True) if path.exists() else pd.DataFrame()
+        base = fast_read(path, fast_bars=0, log_label=path.name) if path.exists() else pd.DataFrame()
 
         for ticker, (df, mode) in all_data.items():
             if col_key not in df.columns:
@@ -230,7 +231,7 @@ if all_data:
                 base[ticker] = new_series
 
         base.sort_index(inplace=True)
-        base.to_csv(path)
+        save_with_parquet(base, path)
         print(f"Saved {filename}: {base.shape[1]} tickers, {base.shape[0]} rows")
 else:
     print("No new data downloaded — CSVs unchanged.")
@@ -238,7 +239,7 @@ else:
 
 # ── Gap audit ─────────────────────────────────────────────────────────────────
 print("\n── Gap audit ─────────────────────────────────────────────────────────")
-closes = pd.read_csv(closes_path, index_col=0, parse_dates=True)
+closes = fast_read(closes_path, fast_bars=0, log_label=closes_path.name)
 if closes.index.tz is None:
     closes.index = closes.index.tz_localize("UTC").tz_convert("US/Eastern")
 else:
