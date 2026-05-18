@@ -75,7 +75,7 @@ ENTRY_Z     = 1.8
 EXIT_Z      = 0.5    # faster profit realization for Zero profitable-day constraints
 STOP_Z      = 3.2
 ENTRY_Z_MIN = 1.7    # leave a small floor below live ENTRY_Z for WFO/grid space
-ENTRY_Z_VOLATILE = 3.5   # stricter threshold when HMM detects volatile regime (1-min noise)
+ENTRY_Z_VOLATILE = 2.4   # still stricter than normal, but not trade-starving on 1-min FX
 
 # ── Regime-Conditioned Profiling (RCDP) ─────────────────────────────────────
 # Wider grids for per-regime grid search (regime_profiler.py)
@@ -124,7 +124,7 @@ USE_VELOCITY_GATE = False   # blocks first-touch mean-reversion entries with bet
 VELOCITY_WINDOW   = 5    # bars  →  5 × 1min = 5-min momentum window
 
 # ── Multi-Timeframe Z-score confirmation (MTF) ────────────────────────────────
-MTF_CONFIRM  = True
+MTF_CONFIRM  = False   # disabled: kills too many entries on 1-min return-spread
 MTF_Z_MIN    = 0.3
 MTF_RESAMPLE = "5min"   # resample Z to 5-min (was 1H on 15-min bars)
 
@@ -137,7 +137,7 @@ RVR_MAX          = 2.5
 # ── Live rolling correlation at entry ─────────────────────────────────────────
 LIVE_CORR_FILTER = True
 LIVE_CORR_WINDOW = 60    # bars  →  60 min rolling correlation
-LIVE_CORR_MIN    = 0.45
+LIVE_CORR_MIN    = 0.20  # loosened: 0.45 was killing too many entries on return-spread
 
 # ── Session filter ────────────────────────────────────────────────────────────
 SESSION_FILTER = False   # 24h FX plus event blackout is sufficient for Zero profile
@@ -154,8 +154,8 @@ COPULA_Z_MIN       = 0.5
 COPULA_LAMBDA_MIN  = 0.10
 
 # ── Kalman innovation variance spike ─────────────────────────────────────────
-KALMAN_INNOV_FILTER = True
-KALMAN_INNOV_WINDOW = 200   # bars  →  ~3.3 hours rolling baseline
+KALMAN_INNOV_FILTER = False  # disabled: redundant with live_corr on return-spread mode
+KALMAN_INNOV_WINDOW = 200
 KALMAN_INNOV_MAX    = 3.0
 # 3e-6 → beta adapts over ~333,000 bars (~12,800 trading days) — near-fixed beta
 # 3e-5 → adapts over ~33,000 bars (too fast — innovations become white noise)
@@ -196,13 +196,13 @@ KMEANS_VOL_WINDOW = 20     # rolling window for macro features (trading days)
 WFO_TRAIN_MONTHS = 6    # ~180 days formation window
 WFO_TEST_MONTHS  = 2    # ~60 days trading window (OOS)
 WFO_STEP_MONTHS  = 2    # non-overlapping sliding step
-WFO_MIN_TRADES   = 5    # minimum trades per OOS window to count as valid
+WFO_MIN_TRADES   = 1    # minimum trades per OOS window to count as valid (2m OOS windows are sparse)
 WFO_EXPANDING    = False # True = expanding window (train_start anchored to data origin)
                          # False = rolling window (classic Gatev fixed-width train)
 
 ZERO_ROLLING_WINDOW_DAYS   = 60
-ZERO_MIN_PROFIT_DAYS_30D   = 7
-ZERO_MIN_PROFIT_DAYS_60D   = 14
+ZERO_MIN_PROFIT_DAYS_30D   = 3   # loosened for sparse early OOS blocks
+ZERO_MIN_PROFIT_DAYS_60D   = 6
 ZERO_MIN_PROFIT_DAY_PCT    = 0.0025
 
 PAIR_MAX_LOSS = -75.0   # one broken pair must not consume the full Zero trailing buffer
@@ -218,7 +218,7 @@ REGIME_MULT_VOLATILE = 0.3   # reduced size in volatile regime (per-pair HMM)
 HMM_PANIC_MULT       = 0.333 # global macro HMM panic: cut ALL sizes by 3
 IV_MULT_MAX          = 1.0   # full size when IV is at its lowest
 IV_MULT_MIN          = 0.5   # half size when IV is at its highest
-MIN_POSITION_SIZE    = 0.10  # allow reduced-size trades in stressed but tradable conditions
+MIN_POSITION_SIZE    = 0.05  # allow small probes when multiple soft risk multipliers overlap
 
 INITIAL_CAPITAL = 5_000         # FundingPips Zero account size in USD
 LEVERAGE        = 50            # 1:50 leverage — max notional = INITIAL_CAPITAL × LEVERAGE

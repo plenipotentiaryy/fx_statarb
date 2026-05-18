@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import statsmodels.api as sm
 import os
+import json
 from pathlib import Path
 from collections import Counter
 from config import (
@@ -43,15 +44,29 @@ from macro_calendar import build_event_blackout
 from config import HURST_ENTRY_WINDOW
 from utils import fast_read, save_with_parquet
 from execution_stress import ExecutionSimulator, ExecutionResult
+from regime_block_bootstrap import RegimeBlockBootstrap, attach_regime_to_trades
 
 BARS_PER_TRADING_DAY = BARS_PER_DAY
 _RECENT_BARS_ENV = int(os.getenv("BACKTEST_RECENT_BARS", "0") or 0)
 BACKTEST_SMOKE = os.getenv("BACKTEST_SMOKE", "0") == "1"
 BACKTEST_SKIP_PLOTS = BACKTEST_SMOKE or os.getenv("BACKTEST_SKIP_PLOTS", "0") == "1"
 BACKTEST_PROGRESS = BACKTEST_SMOKE or os.getenv("BACKTEST_PROGRESS", "0") == "1"
+AFES_ALLOW_EMPTY_RUN = os.getenv("AFES_ALLOW_EMPTY_RUN", "0") == "1"
+AFES_PAIRS_PATH = os.getenv("AFES_PAIRS_PATH", "").strip()
+AFES_WFO_PARAMS_PATH = os.getenv("AFES_WFO_PARAMS_PATH", "").strip()
+AFES_OPT_PARAMS_PATH = os.getenv("AFES_OPT_PARAMS_PATH", "").strip()
+AFES_DISABLE_OPT_OVERRIDE = os.getenv("AFES_DISABLE_OPT_OVERRIDE", "0") == "1"
+AFES_TEST_END_DATE = os.getenv("AFES_TEST_END_DATE", "").strip()
+AFES_OOS_PARAMS_DIR = os.getenv("AFES_OOS_PARAMS_DIR", "").strip()
+AFES_EQUITY_CURVE = os.getenv("AFES_EQUITY_CURVE", "0") == "1"
+AFES_MTM_STRICT = os.getenv("AFES_MTM_STRICT", "1") == "1"
+AFES_MTM_HALT_SCOPE = os.getenv("AFES_MTM_HALT_SCOPE", "block").strip().lower()  # "block" or "day"
+AFES_TRUE_OOS = os.getenv("AFES_TRUE_OOS", "0") == "1"  # disable globally-fitted aux artifacts (regimes/HMM/KMeans/sessions/OU MC)
 
 
 def _pairs_universe_path() -> str:
+    if AFES_PAIRS_PATH:
+        return AFES_PAIRS_PATH
     zero_path = DATA_DIR / "pairs_zero_universe.csv"
     if ACCOUNT_MODEL == "Zero" and zero_path.exists():
         try:
@@ -121,12 +136,21 @@ def load_closes() -> pd.DataFrame:
             recent_bars = int(os.getenv("BACKTEST_RECENT_BARS", "0") or 0)
             if recent_bars > 0:
                 closes = closes.tail(recent_bars)
+            # Clip to OOS block end date — prevents Kalman from seeing future bars.
+            if AFES_TEST_END_DATE:
+                test_end_ts = pd.Timestamp(AFES_TEST_END_DATE).tz_localize("US/Eastern")
+                closes = closes[closes.index <= test_end_ts]
+                print(f"Data clipped to test_end={AFES_TEST_END_DATE} ({len(closes)} bars)")
             return closes
 
     closes = closes.dropna()
     recent_bars = int(os.getenv("BACKTEST_RECENT_BARS", "0") or 0)
     if recent_bars > 0:
         closes = closes.tail(recent_bars)
+    if AFES_TEST_END_DATE:
+        test_end_ts = pd.Timestamp(AFES_TEST_END_DATE).tz_localize("US/Eastern")
+        closes = closes[closes.index <= test_end_ts]
+        print(f"Data clipped to test_end={AFES_TEST_END_DATE} ({len(closes)} bars)")
     return closes
 
 
@@ -411,6 +435,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                   hurst_filter: HurstFilter | None = None,
                   spread_daily: pd.Series | None = None,
                   oos_start: pd.Timestamp | None = None,
+                  oos_end: pd.Timestamp | None = None,
                   max_notional: float = 1e9,
                   max_hold_bars: int = 9999,
                   session_window: tuple[int, int] | None = None,
@@ -437,11 +462,28 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
     active_exit_thresh = exit_thresh   # exit/stop thresholds active for current trade
     active_stop_thresh = stop_thresh   # (may change per regime at entry time)
     diag = Counter()
+    zero_mtm_state: dict[str, object] = {
+        "last_day": None,
+        "day_start_equity": float(INITIAL_CAPITAL),
+        "peak_equity": float(INITIAL_CAPITAL),
+        "halt_entries_today": False,
+        "min_equity": float(INITIAL_CAPITAL),
+        "mtm_drawdown_min": 0.0,
+        "forced_liquidations": 0,
+        "daily_breach": False,
+        "trailing_breach": False,
+    }
+    zero_mtm_breach_bar: int | None = None
+    zero_mtm_breach_reason: str | None = None
+    zero_mtm_breach_exit_reason: str | None = None
+    zero_mtm_breach_ctx: dict[str, object] = {}
+    equity_curve_rows: list[dict[str, object]] = [] if AFES_EQUITY_CURVE else []
+    block_halted: bool = False
 
     # ── prices_df for ExecutionSimulator (one-shot precompute) ────────────
     if exec_sim is not None:
         _sim_cols: dict[str, pd.Series] = {"close": df["spread"]}
-        if "spread_vwap_mtf" in df.columns:
+        if "spread_vwap_mtf" in df.columns and df["spread_vwap_mtf"].notna().any():
             _sim_cols["vwap"] = df["spread_vwap_mtf"]
         if "vol_ratio" in df.columns:
             _sim_cols["vol_ratio"] = df["vol_ratio"]
@@ -462,6 +504,10 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
         spread_now = df["spread"].iloc[i]
         p1         = df[t1_col].iloc[i]
         p2         = df[t2_col].iloc[i]
+        current_day = pd.Timestamp(ts).normalize()
+
+        if zero_mtm_state.get("last_day") is not None and current_day != zero_mtm_state["last_day"]:
+            zero_mtm_state["halt_entries_today"] = False
 
         # ── Phase 1: cointegration validity (O(1) daily lookup) ───────────
         if coint_filter is not None:
@@ -506,6 +552,63 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                 suspended
                 or (macro_filter is not None and macro_filter.is_force_close(ts))
             )
+        zero_mtm = compute_bar_mtm_equity(
+            cumulative_pnl=cumulative_pnl,
+            position=position,
+            entry_spread=entry_spread,
+            entry_n_shares=entry_n_shares,
+            bar_index=i,
+            fallback_spread=spread_now,
+            prices_df=_prices_df,
+            exec_sim=exec_sim,
+        )
+        zero_mtm_check = apply_zero_mtm_constraints(
+            equity=zero_mtm["equity"],
+            bar_ts=ts,
+            zero_state=zero_mtm_state,
+        )
+        zero_mtm_state["min_equity"] = min(float(zero_mtm_state.get("min_equity", zero_mtm["equity"])), float(zero_mtm["equity"]))
+        zero_mtm_state["mtm_drawdown_min"] = min(
+            float(zero_mtm_state.get("mtm_drawdown_min", 0.0)),
+            float(zero_mtm["equity"] - float(zero_mtm_state.get("peak_equity", INITIAL_CAPITAL))),
+        )
+        if AFES_EQUITY_CURVE:
+            equity_curve_rows.append({
+                "timestamp": ts,
+                "cash_realized": zero_mtm["cash_realized"],
+                "open_unrealized": zero_mtm["open_unrealized"],
+                "equity": zero_mtm["equity"],
+                "day_start_equity": zero_mtm_check["day_start_equity"],
+                "peak_equity": zero_mtm_check["peak_equity"],
+                "daily_floor": zero_mtm_check["daily_floor"],
+                "trailing_floor": zero_mtm_check["trailing_floor"],
+                "n_open_positions": int(position != 0),
+                "breach_type": zero_mtm_check.get("reason"),
+            })
+        if zero_mtm_check["breach"]:
+            zero_mtm_state["forced_liquidations"] = int(zero_mtm_state.get("forced_liquidations", 0)) + 1
+            if zero_mtm_check["reason"] == "ZERO_DAILY_MTM_BREACH":
+                zero_mtm_state["daily_breach"] = True
+            elif zero_mtm_check["reason"] == "ZERO_TRAILING_MTM_BREACH":
+                zero_mtm_state["trailing_breach"] = True
+            zero_mtm_breach_bar = i
+            zero_mtm_breach_reason = str(zero_mtm_check["reason"])
+            zero_mtm_breach_exit_reason = str(zero_mtm_check["reason"])
+            if zero_mtm_check["reason"] == "ZERO_DAILY_MTM_BREACH" and zero_mtm_state.get("daily_breach_bar_ts") is None:
+                zero_mtm_state["daily_breach_bar_ts"] = ts
+            elif zero_mtm_check["reason"] == "ZERO_TRAILING_MTM_BREACH" and zero_mtm_state.get("trailing_breach_bar_ts") is None:
+                zero_mtm_state["trailing_breach_bar_ts"] = ts
+            zero_mtm_breach_ctx = {
+                "breach_type": "daily_loss" if zero_mtm_check["reason"] == "ZERO_DAILY_MTM_BREACH" else "trailing_loss",
+                "breach_timestamp": ts,
+                "equity_at_breach": float(zero_mtm["equity"]),
+                "daily_floor_at_breach": float(zero_mtm_check["daily_floor"]),
+                "trailing_floor_at_breach": float(zero_mtm_check["trailing_floor"]),
+            }
+            force_close = True
+            if position == 0 and AFES_MTM_HALT_SCOPE == "block":
+                block_halted = True
+                break
         if position != 0 and force_close:
             n              = entry_n_shares
             if exec_sim is not None:
@@ -520,9 +623,12 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
             borrow_cost    = short_notional * BORROW_RATE_ANNUAL * holding_days / 252
             net_pnl        = gross_pnl - tx_cost - borrow_cost
             cumulative_pnl += net_pnl
-            reason = ("COINT_BREAK" if suspended
-                      else macro_filter.force_close_reason(ts))
-            trades.append({
+            if zero_mtm_breach_reason is not None and zero_mtm_breach_bar == i:
+                reason = zero_mtm_breach_exit_reason or zero_mtm_breach_reason
+            else:
+                reason = ("COINT_BREAK" if suspended
+                          else macro_filter.force_close_reason(ts))
+            trade_rec = {
                 "pair":         f"{t1}-{t2}",
                 "entry_time":   df.index[entry_bar],
                 "exit_time":    ts,
@@ -538,11 +644,24 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                 "exit_reason":  reason,
                 "entry_z":      round(df["zscore"].iloc[entry_bar], 2),
                 "exit_z":       round(z, 2),
-            })
+            }
+            if zero_mtm_breach_bar is not None and zero_mtm_breach_bar == i and zero_mtm_breach_ctx:
+                trade_rec["forced_liquidation"] = True
+                trade_rec["breach_type"] = zero_mtm_breach_ctx.get("breach_type")
+                trade_rec["breach_timestamp"] = zero_mtm_breach_ctx.get("breach_timestamp")
+                trade_rec["equity_at_breach"] = zero_mtm_breach_ctx.get("equity_at_breach")
+                trade_rec["daily_floor_at_breach"] = zero_mtm_breach_ctx.get("daily_floor_at_breach")
+                trade_rec["trailing_floor_at_breach"] = zero_mtm_breach_ctx.get("trailing_floor_at_breach")
+            trades.append(trade_rec)
             position       = 0
             entry_n_shares = 1.0
             if cumulative_pnl < PAIR_MAX_LOSS:
                 break
+            if zero_mtm_breach_bar is not None and zero_mtm_breach_bar == i:
+                if AFES_MTM_HALT_SCOPE == "block":
+                    block_halted = True
+                    break
+                continue
             continue
 
         # ── Normal exit / stop / time-stop ───────────────────────────────
@@ -603,6 +722,12 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
         if position == 0:
             if oos_start is not None and ts < oos_start:
                 diag["pre_oos"] += 1
+                continue
+            if oos_end is not None and ts > oos_end:
+                diag["post_oos"] = diag.get("post_oos", 0) + 1
+                continue
+            if zero_mtm_state.get("halt_entries_today", False):
+                diag["zero_mtm_halt"] += 1
                 continue
             if suspended:
                 diag["suspended"] += 1
@@ -869,6 +994,20 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
     out = pd.DataFrame(trades)
     out.attrs["diag"] = dict(diag)
     out.attrs["hurst_guarded"] = hurst_guarded
+    out.attrs["zero_mtm"] = {
+        "daily_breach": bool(zero_mtm_state.get("daily_breach", False)),
+        "trailing_breach": bool(zero_mtm_state.get("trailing_breach", False)),
+        "daily_loss_breach_bar": zero_mtm_state.get("daily_breach_bar_ts"),
+        "trailing_loss_breach_bar": zero_mtm_state.get("trailing_breach_bar_ts"),
+        "forced_liquidations": int(zero_mtm_state.get("forced_liquidations", 0)),
+        "max_liquidation_drawdown": float(zero_mtm_state.get("mtm_drawdown_min", 0.0)),
+        "min_equity": float(zero_mtm_state.get("min_equity", INITIAL_CAPITAL)),
+        "peak_equity": float(zero_mtm_state.get("peak_equity", INITIAL_CAPITAL)),
+        "block_halted": bool(block_halted),
+        "halt_scope": AFES_MTM_HALT_SCOPE,
+    }
+    if AFES_EQUITY_CURVE and equity_curve_rows:
+        out.attrs["equity_curve"] = pd.DataFrame(equity_curve_rows).set_index("timestamp")
     return out
 
 
@@ -925,7 +1064,9 @@ if EVENT_FILTER:
 
 # Load session windows per pair (optimal UTC hours from gen_full_sessions.py)
 _sessions: dict[str, tuple[int, int]] = {}
-if SESSION_FILTER:
+if AFES_TRUE_OOS:
+    print("TRUE_OOS: pair_sessions DISABLED (fitted on full history)")
+elif SESSION_FILTER:
     _sess_path = DATA_DIR / "pair_sessions.csv"
     if _sess_path.exists():
         _sess_df = fast_read(_sess_path, prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label=_sess_path.name).set_index("pair")
@@ -959,22 +1100,33 @@ else:
     print("CointegrationFilter skipped (return-spread mode)")
 
 # Phase 4: load K-Means macro regime
-_kmeans_regime = load_kmeans_regime()
-if _kmeans_regime is not None:
-    sideways_pct = (_kmeans_regime == 1).mean() * 100
-    panic_pct    = (_kmeans_regime == 2).mean() * 100
-    print(f"K-Means regimes loaded  "
-          f"(Sideways {sideways_pct:.0f}%  Panic {panic_pct:.0f}%  "
-          f"Trend {100-sideways_pct-panic_pct:.0f}%)")
+if AFES_TRUE_OOS:
+    _kmeans_regime = None
+    print("TRUE_OOS: K-Means regimes DISABLED (fitted on full history → look-ahead)")
 else:
-    print("No kmeans_regimes.csv — K-Means gate disabled (run step5_kmeans.py)")
+    _kmeans_regime = load_kmeans_regime()
+    if _kmeans_regime is not None:
+        sideways_pct = (_kmeans_regime == 1).mean() * 100
+        panic_pct    = (_kmeans_regime == 2).mean() * 100
+        print(f"K-Means regimes loaded  "
+              f"(Sideways {sideways_pct:.0f}%  Panic {panic_pct:.0f}%  "
+              f"Trend {100-sideways_pct-panic_pct:.0f}%)")
+    else:
+        print("No kmeans_regimes.csv — K-Means gate disabled (run step5_kmeans.py)")
 
 # Full history for Kalman warmup (train + test, no date split)
 # Load dynamic sizing components (step5 + step7 + step8 → step9)
-_regimes             = load_regimes()
-_vix, _macro_alert_s = load_iv()
-_global_hmm_s        = load_global_hmm()
-_mc_conf             = load_mc_confidence()
+if AFES_TRUE_OOS:
+    _regimes = None
+    _vix, _macro_alert_s = None, None
+    _global_hmm_s = None
+    _mc_conf = {}
+    print("TRUE_OOS: regimes / VIX / global HMM / MC sizing DISABLED (all fitted on full history)")
+else:
+    _regimes             = load_regimes()
+    _vix, _macro_alert_s = load_iv()
+    _global_hmm_s        = load_global_hmm()
+    _mc_conf             = load_mc_confidence()
 
 # Build single MacroFilter (shared across all pairs — market-wide signal)
 _macro_filter = MacroFilter(_macro_alert_s, _global_hmm_s, _kmeans_regime)
@@ -1023,8 +1175,38 @@ if pairs.empty:
 
 # ── Load per-pair optimal params (from step3j WFO or step4d grid search) ──────
 _opt_params: dict[str, tuple[float, float, float]] = {}
-_wfo_path = DATA_DIR / "wfo_params.csv"
-_opt_path = DATA_DIR / "optimal_params.csv"
+
+# OOS-snapshot mode: look up params_<snapshot_id>.csv by current block's
+# test_start_date. No silent fallback to global wfo_params.csv.
+_oos_snapshot_path: Path | None = None
+if AFES_OOS_PARAMS_DIR and "test_start_date" in pairs.columns:
+    _snap_ts = pd.Timestamp(pairs["test_start_date"].iloc[0])
+    _snap_id = _snap_ts.strftime("%Y%m%d")
+    _oos_snapshot_path = Path(AFES_OOS_PARAMS_DIR) / f"params_{_snap_id}.csv"
+    if not _oos_snapshot_path.exists():
+        raise SystemExit(
+            f"WARNING: Missing OOS params snapshot for {_snap_id} "
+            f"({_oos_snapshot_path}). Skipping test block."
+        )
+    # Verify metadata matches current block — refuse to use a misaligned snapshot.
+    _snap_head = pd.read_csv(_oos_snapshot_path, nrows=1)
+    if "snapshot_id" in _snap_head.columns and str(_snap_head["snapshot_id"].iloc[0]) != _snap_id:
+        raise SystemExit(
+            f"Snapshot id mismatch: file has {_snap_head['snapshot_id'].iloc[0]}, "
+            f"expected {_snap_id}. Refusing to use misaligned params."
+        )
+    if "test_start_date" in _snap_head.columns:
+        _file_start = pd.Timestamp(_snap_head["test_start_date"].iloc[0]).normalize()
+        if _file_start != _snap_ts.normalize():
+            raise SystemExit(
+                f"test_start_date mismatch: file={_file_start.date()}, expected={_snap_ts.date()}"
+            )
+    print(f"OOS params snapshot loaded: {_oos_snapshot_path}")
+
+_wfo_path = _oos_snapshot_path if _oos_snapshot_path else (
+    Path(AFES_WFO_PARAMS_PATH) if AFES_WFO_PARAMS_PATH else (DATA_DIR / "wfo_params.csv")
+)
+_opt_path = Path(AFES_OPT_PARAMS_PATH) if AFES_OPT_PARAMS_PATH else (DATA_DIR / "optimal_params.csv")
 
 # When using return-spread mode, WFO params from daily price-spread runs are
 # incompatible (different strategy, different units, different half-life).
@@ -1043,7 +1225,7 @@ else:
                                        float(_r["stop_z"]))
         print(f"WFO baseline loaded   (wfo_params.csv):      {len(_opt_params)} pairs")
 
-    if _opt_path.exists():
+    if (not AFES_DISABLE_OPT_OVERRIDE) and (_oos_snapshot_path is None) and _opt_path.exists():
         _grid_df = fast_read(_opt_path, prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label=_opt_path.name)
         n_before = len(_opt_params)
         for _, _r in _grid_df.iterrows():
@@ -1053,6 +1235,8 @@ else:
         n_overridden = len(_grid_df)
         print(f"Grid search override  (optimal_params.csv):  {n_overridden} pairs  "
               f"[priority over WFO]")
+    elif AFES_DISABLE_OPT_OVERRIDE:
+        print("Grid search override disabled (AFES_DISABLE_OPT_OVERRIDE=1)")
 
 if not _opt_params:
     print("No optimized params found — will use OU Monte Carlo defaults.")
@@ -1060,7 +1244,9 @@ if not _opt_params:
 # ── Load regime-conditioned thresholds (from regime_profiler.py) ──────────────
 _regime_thresholds: dict[str, dict] = {}
 _rt_path = DATA_DIR / "regime_thresholds.csv"
-if _rt_path.exists():
+if AFES_TRUE_OOS:
+    print("TRUE_OOS: regime_thresholds DISABLED (fitted on full history)")
+elif _rt_path.exists():
     _rt_df = fast_read(_rt_path, prefer_parquet=False, fast_bars=0, index_col=None, parse_dates=False, log_label=_rt_path.name)
     for _, _r in _rt_df[_rt_df["regime"] == 1].iterrows():
         _regime_thresholds[_r["pair"]] = {
@@ -1141,12 +1327,109 @@ def _rolling_window_activity(daily_pnl: pd.Series, window_days: int) -> tuple[in
     return trade_max, profit_max, pnl_max
 
 
+def compute_bar_mtm_equity(
+    *,
+    cumulative_pnl: float,
+    position: int,
+    entry_spread: float,
+    entry_n_shares: float,
+    bar_index: int,
+    fallback_spread: float,
+    prices_df: pd.DataFrame | None,
+    exec_sim: "ExecutionSimulator | None",
+) -> dict[str, float]:
+    """Compute bar-level cash, stressed liquidation value and equity.
+
+    The open leg is marked with the stressed exit price from ExecutionSimulator
+    so the unrealized PnL reflects bid/ask and adverse slippage instead of a
+    mid-price assumption.
+    """
+    cash_realized = float(INITIAL_CAPITAL + cumulative_pnl)
+    open_unrealized = 0.0
+    mark_price = float(fallback_spread)
+
+    if position != 0:
+        if exec_sim is not None and prices_df is not None:
+            stressed = float(exec_sim.stress_exit_price(
+                prices_df,
+                bar_index=bar_index,
+                side_to_close=-position,
+            ))
+            if not np.isfinite(stressed):
+                if AFES_MTM_STRICT:
+                    raise RuntimeError(
+                        f"MTM mark unavailable at bar_index={bar_index}: stress_exit_price returned non-finite"
+                    )
+                stressed = float(fallback_spread)
+            mark_price = stressed
+        elif not np.isfinite(mark_price):
+            if AFES_MTM_STRICT:
+                raise RuntimeError(f"MTM mark unavailable at bar_index={bar_index}: fallback_spread non-finite")
+        open_unrealized = float(position * (mark_price - entry_spread) * entry_n_shares)
+
+    equity = cash_realized + open_unrealized
+    return {
+        "cash_realized": cash_realized,
+        "open_unrealized": open_unrealized,
+        "equity": equity,
+        "mark_price": mark_price,
+    }
+
+
+def apply_zero_mtm_constraints(
+    *,
+    equity: float,
+    bar_ts: pd.Timestamp,
+    zero_state: dict[str, object],
+    daily_loss_pct: float = ZERO_MAX_DAILY_LOSS_PCT,
+    trailing_loss_pct: float = ZERO_MAX_TRAILING_LOSS_PCT,
+) -> dict[str, object]:
+    """Update day/peak equity and test Zero intraday MTM floors."""
+    current_day = pd.Timestamp(bar_ts).normalize()
+    last_day = zero_state.get("last_day")
+
+    if last_day is None or current_day != last_day:
+        zero_state["last_day"] = current_day
+        zero_state["day_start_equity"] = float(equity)
+        zero_state["halt_entries_today"] = False
+
+    peak_equity = max(float(zero_state.get("peak_equity", equity)), float(equity))
+    zero_state["peak_equity"] = peak_equity
+
+    day_start_equity = float(zero_state.get("day_start_equity", equity))
+    daily_floor = day_start_equity * (1.0 - float(daily_loss_pct))
+    trailing_floor = peak_equity * (1.0 - float(trailing_loss_pct))
+
+    breach_reason = None
+    if equity < daily_floor:
+        breach_reason = "ZERO_DAILY_MTM_BREACH"
+    elif equity < trailing_floor:
+        breach_reason = "ZERO_TRAILING_MTM_BREACH"
+
+    if breach_reason is not None:
+        zero_state["halt_entries_today"] = True
+        zero_state["breach_reason"] = breach_reason
+        zero_state["breach_bar_ts"] = bar_ts
+
+    return {
+        "breach": breach_reason is not None,
+        "reason": breach_reason,
+        "daily_floor": daily_floor,
+        "trailing_floor": trailing_floor,
+        "day_start_equity": day_start_equity,
+        "peak_equity": peak_equity,
+        "halt_entries_today": bool(zero_state.get("halt_entries_today", False)),
+        "last_day": current_day,
+    }
+
+
 def zero_account_report(df_trades: pd.DataFrame,
                         initial_capital: float) -> dict[str, object]:
     """Approximate FundingPips Zero compliance from realized trade exits."""
     if df_trades.empty:
         return {
             "trading_days": 0,
+            "observed_days": 0,
             "max_inactive_days": None,
             "trailing_loss_breached": False,
             "daily_loss_breached": False,
@@ -1166,6 +1449,7 @@ def zero_account_report(df_trades: pd.DataFrame,
     daily_pnl = trades.groupby("trade_day")["dollar_pnl"].sum().sort_index()
     all_days = pd.date_range(daily_pnl.index.min(), daily_pnl.index.max(), freq="D", tz=daily_pnl.index.tz)
     daily_pnl = daily_pnl.reindex(all_days, fill_value=0.0)
+    observed_days = len(daily_pnl)
     daily_equity = initial_capital + daily_pnl.cumsum()
 
     # Daily loss limit: 3% of day-start equity, checked on each realized trade exit.
@@ -1209,6 +1493,7 @@ def zero_account_report(df_trades: pd.DataFrame,
 
     return {
         "trading_days": int(len(trade_days)),
+        "observed_days": int(observed_days),
         "max_inactive_days": inactive_days,
         "trailing_loss_breached": bool(trailing_loss_breached),
         "daily_loss_breached": bool(daily_loss_breached),
@@ -1272,8 +1557,25 @@ def apply_zero_hard_constraints(df_trades: pd.DataFrame,
 def zero_universe_ok(zero: dict[str, object]) -> bool:
     """Universe curation gate for Zero profile.
 
-    Uses both the prop rules (30d) and a longer 60d stability window.
+    Uses the prop-style 30d activity gate for short OOS blocks. The 60d
+    stability gate is enforced only when the evaluated history actually spans
+    at least ZERO_ROLLING_WINDOW_DAYS; otherwise every 30d snapshot is rejected
+    by construction.
     """
+    observed_days = int(zero.get("observed_days", 0) or 0)
+    enough_for_60d = observed_days >= ZERO_ROLLING_WINDOW_DAYS
+    activity_ok = (
+        int(zero.get("max_trade_days_30d", 0)) >= ZERO_MIN_PROFIT_DAYS_30D
+        and int(zero.get("max_profit_days_30d", 0)) >= ZERO_MIN_PROFIT_DAYS_30D
+        and float(zero.get("max_30d_pnl", 0.0)) > 0.0
+    )
+    if enough_for_60d:
+        activity_ok = activity_ok and (
+            int(zero.get("max_trade_days_60d", 0)) >= ZERO_MIN_PROFIT_DAYS_60D
+            and int(zero.get("max_profit_days_60d", 0)) >= ZERO_MIN_PROFIT_DAYS_60D
+            and float(zero.get("max_60d_pnl", 0.0)) > 0.0
+        )
+
     return (
         not bool(zero.get("trailing_loss_breached", False))
         and not bool(zero.get("daily_loss_breached", False))
@@ -1281,12 +1583,192 @@ def zero_universe_ok(zero: dict[str, object]) -> bool:
             zero.get("max_inactive_days") is None
             or int(zero.get("max_inactive_days", 0)) <= ZERO_MAX_INACTIVE_DAYS
         )
-        and int(zero.get("max_trade_days_30d", 0)) >= ZERO_MIN_PROFIT_DAYS_30D
-        and int(zero.get("max_profit_days_30d", 0)) >= ZERO_MIN_PROFIT_DAYS_30D
-        and int(zero.get("max_trade_days_60d", 0)) >= ZERO_MIN_PROFIT_DAYS_60D
-        and int(zero.get("max_profit_days_60d", 0)) >= ZERO_MIN_PROFIT_DAYS_60D
-        and float(zero.get("max_60d_pnl", 0.0)) > 0.0
+        and activity_ok
     )
+
+
+def build_research_report(
+    df_trades: pd.DataFrame,
+    regime_series: pd.Series | None = None,
+    *,
+    bootstrap_samples: int = 10_000,
+    bootstrap_block_size: int = 20,
+) -> dict[str, object]:
+    """Return trading-performance metrics separated from prop constraints."""
+    if df_trades.empty:
+        return {
+            "trades": 0,
+            "trade_hit_rate": float("nan"),
+            "total_pnl": 0.0,
+            "gross_pnl": 0.0,
+            "costs": 0.0,
+            "sharpe_annualized": float("nan"),
+            "daily_sharpe_annualized": float("nan"),
+            "trade_sharpe_annualized": float("nan"),
+            "max_drawdown": 0.0,
+            "bootstrap": None,
+        }
+
+    pnl = pd.to_numeric(df_trades["net_pnl"], errors="coerce").fillna(0.0)
+    winning = pnl[pnl > 0]
+    losing = pnl[pnl <= 0]
+    days_total = pd.to_datetime(df_trades["exit_time"].iloc[-1]) - pd.to_datetime(df_trades["exit_time"].iloc[0])
+    trades_per_year = len(df_trades) / max(days_total.days / 365.25, 1 / 365.25)
+    trade_sharpe = pnl.mean() / pnl.std() * np.sqrt(trades_per_year) if pnl.std() > 0 else 0.0
+    pnl_for_daily = pd.to_numeric(
+        df_trades["dollar_pnl"] if "dollar_pnl" in df_trades.columns else df_trades["net_pnl"],
+        errors="coerce",
+    ).fillna(0.0)
+    exit_times_daily = pd.to_datetime(df_trades["exit_time"], utc=True, errors="coerce")
+    daily = (
+        pd.DataFrame({"exit_time": exit_times_daily, "pnl": pnl_for_daily})
+        .dropna(subset=["exit_time"])
+        .assign(trade_day=lambda x: x["exit_time"].dt.floor("D"))
+        .groupby("trade_day")["pnl"].sum()
+        .sort_index()
+    )
+    if not daily.empty:
+        full_days = pd.date_range(daily.index.min(), daily.index.max(), freq="D", tz=daily.index.tz)
+        daily = daily.reindex(full_days, fill_value=0.0)
+    daily_returns = daily / float(INITIAL_CAPITAL) if not daily.empty else pd.Series(dtype=float)
+    daily_sharpe = (
+        float(daily_returns.mean() / daily_returns.std() * np.sqrt(252))
+        if len(daily_returns) > 1 and daily_returns.std() > 0
+        else 0.0
+    )
+    cumulative = pnl.cumsum()
+    max_drawdown = float((cumulative - cumulative.cummax()).min())
+
+    bootstrap_summary = None
+    try:
+        from regime_block_bootstrap import RegimeBlockBootstrap, attach_regime_to_trades
+
+        boot_input = df_trades.copy()
+        if regime_series is not None:
+            boot_input = attach_regime_to_trades(boot_input, regime_series)
+        bootstrapper = RegimeBlockBootstrap(
+            block_size=bootstrap_block_size,
+            n_bootstrap=bootstrap_samples,
+            pnl_col="net_pnl",
+            regime_col="hmm_regime",
+            random_seed=42,
+        )
+        bootstrap_summary = bootstrapper.bootstrap_metrics(boot_input)
+        bootstrap_summary = {
+            "n_obs": bootstrap_summary.get("n_obs"),
+            "realized": bootstrap_summary.get("realized"),
+            "confidence_intervals": bootstrap_summary.get("confidence_intervals"),
+        }
+    except Exception as exc:
+        bootstrap_summary = {"error": str(exc)}
+    bootstrap_summary = json.dumps(bootstrap_summary, sort_keys=True) if bootstrap_summary is not None else None
+
+    return {
+        "trades": int(len(df_trades)),
+        "trades_per_year": float(trades_per_year),
+        "trade_hit_rate": float((pnl > 0).mean() * 100),
+        "total_pnl": float(pnl.sum()),
+        "gross_pnl": float(df_trades["gross_pnl"].sum()) if "gross_pnl" in df_trades.columns else 0.0,
+        "costs": float((df_trades["tx_cost"] + df_trades["borrow_cost"]).sum()) if {"tx_cost", "borrow_cost"}.issubset(df_trades.columns) else 0.0,
+        "sharpe_annualized": daily_sharpe,
+        "daily_sharpe_annualized": daily_sharpe,
+        "trade_sharpe_annualized": float(trade_sharpe),
+        "max_drawdown": float(max_drawdown),
+        "profit_factor": float(winning.sum() / abs(losing.sum())) if len(losing) > 0 and losing.sum() != 0 else float("inf"),
+        "bootstrap": bootstrap_summary,
+    }
+
+
+def build_zero_mtm_report(
+    df_trades: pd.DataFrame,
+    pair_zero_mtm: dict[str, dict[str, object]] | None = None,
+    *,
+    initial_capital: float = INITIAL_CAPITAL,
+) -> dict[str, object]:
+    """Return prop-style MTM compliance metrics, separated from research stats."""
+    if df_trades.empty:
+        return {
+            "daily_breach": False,
+            "daily_breach_count": 0,
+            "trailing_breach": False,
+            "trailing_breach_count": 0,
+            "inactivity_breach": False,
+            "inactivity_days": None,
+            "max_trade_days_30d": 0,
+            "max_profit_days_30d": 0,
+            "max_30d_pnl": 0.0,
+            "max_trade_days_60d": 0,
+            "max_profit_days_60d": 0,
+            "max_60d_pnl": 0.0,
+            "profit_days_30_breach": True,
+            "profit_days_60_breach": True,
+            "max_liquidation_drawdown": 0.0,
+            "forced_liquidation_count": 0,
+            "daily_forced_liquidation_count": 0,
+            "trailing_forced_liquidation_count": 0,
+            "pairs_breached": [],
+        }
+
+    trades = df_trades.copy()
+    trades["exit_time"] = pd.to_datetime(trades["exit_time"], utc=True).dt.tz_convert("US/Eastern")
+    trades = trades.sort_values("exit_time")
+    trades["trade_day"] = trades["exit_time"].dt.normalize()
+
+    daily_pnl = trades.groupby("trade_day")["dollar_pnl"].sum().sort_index() if "dollar_pnl" in trades.columns else trades.groupby("trade_day")["net_pnl"].sum().sort_index()
+    all_days = pd.date_range(daily_pnl.index.min(), daily_pnl.index.max(), freq="D", tz=daily_pnl.index.tz)
+    daily_pnl = daily_pnl.reindex(all_days, fill_value=0.0)
+
+    max_trade_days_30d, max_profit_days_30d, max_30d_pnl = _rolling_window_activity(daily_pnl, 30)
+    max_trade_days_60d, max_profit_days_60d, max_60d_pnl = _rolling_window_activity(daily_pnl, ZERO_ROLLING_WINDOW_DAYS)
+
+    trade_days = trades["trade_day"].drop_duplicates().sort_values()
+    inactive_days = None
+    if len(trade_days) >= 2:
+        gaps = trade_days.diff().dt.days.dropna()
+        inactive_days = int(gaps.max() - 1) if not gaps.empty else 0
+    elif len(trade_days) == 1:
+        inactive_days = 0
+
+    pair_zero_mtm = pair_zero_mtm or {}
+    daily_breach = any(bool(v.get("daily_breach", False)) for v in pair_zero_mtm.values())
+    trailing_breach = any(bool(v.get("trailing_breach", False)) for v in pair_zero_mtm.values())
+    daily_breach_count = int(sum(1 for v in pair_zero_mtm.values() if bool(v.get("daily_breach", False))))
+    trailing_breach_count = int(sum(1 for v in pair_zero_mtm.values() if bool(v.get("trailing_breach", False))))
+    forced_liquidations = int(sum(int(v.get("forced_liquidations", 0)) for v in pair_zero_mtm.values()))
+    max_liquidation_drawdown = float(min((float(v.get("max_liquidation_drawdown", 0.0)) for v in pair_zero_mtm.values()), default=0.0))
+    pairs_breached = sorted([p for p, v in pair_zero_mtm.items() if bool(v.get("daily_breach", False)) or bool(v.get("trailing_breach", False))])
+    daily_breach_bars = {p: v.get("daily_loss_breach_bar") for p, v in pair_zero_mtm.items() if v.get("daily_loss_breach_bar") is not None}
+    trailing_breach_bars = {p: v.get("trailing_loss_breach_bar") for p, v in pair_zero_mtm.items() if v.get("trailing_loss_breach_bar") is not None}
+    daily_loss_breach_bar = min(daily_breach_bars.values()) if daily_breach_bars else None
+    trailing_loss_breach_bar = min(trailing_breach_bars.values()) if trailing_breach_bars else None
+    inactivity_breach = bool(inactive_days is not None and inactive_days > ZERO_MAX_INACTIVE_DAYS)
+    profit_days_30_breach = bool(int(max_profit_days_30d) < ZERO_MIN_PROFIT_DAYS_30D)
+    profit_days_60_breach = bool(int(max_profit_days_60d) < ZERO_MIN_PROFIT_DAYS_60D)
+
+    return {
+        "daily_breach": daily_breach,
+        "daily_breach_count": daily_breach_count,
+        "trailing_breach": trailing_breach,
+        "trailing_breach_count": trailing_breach_count,
+        "daily_loss_breach_bar": daily_loss_breach_bar,
+        "trailing_loss_breach_bar": trailing_loss_breach_bar,
+        "pairs_breached_daily": sorted(daily_breach_bars.keys()),
+        "pairs_breached_trailing": sorted(trailing_breach_bars.keys()),
+        "inactivity_breach": inactivity_breach,
+        "inactivity_days": inactive_days,
+        "max_trade_days_30d": int(max_trade_days_30d),
+        "max_profit_days_30d": int(max_profit_days_30d),
+        "max_30d_pnl": round(max_30d_pnl, 4),
+        "max_trade_days_60d": int(max_trade_days_60d),
+        "max_profit_days_60d": int(max_profit_days_60d),
+        "max_60d_pnl": round(max_60d_pnl, 4),
+        "profit_days_30_breach": profit_days_30_breach,
+        "profit_days_60_breach": profit_days_60_breach,
+        "max_liquidation_drawdown": round(max_liquidation_drawdown, 4),
+        "forced_liquidation_count": forced_liquidations,
+        "pairs_breached": pairs_breached,
+        "initial_capital": float(initial_capital),
+    }
 
 _pair_weights = compute_pair_weights(pairs, _opt_path)
 print(f"\nCapital allocation  (method={ALLOCATION_METHOD}, leverage={LEVERAGE}x):")
@@ -1299,21 +1781,34 @@ print()
 # ── OOS start date — read from pairs_selected.csv (set by pairs.py via TRAIN_RATIO)
 # Kalman warms up on full history; trading begins only from this date.
 _oos_start: pd.Timestamp | None = None
+_oos_end:   pd.Timestamp | None = None
 if "test_start_date" in pairs.columns:
     _oos_start = pd.Timestamp(pairs["test_start_date"].iloc[0]).tz_localize("US/Eastern")
-    print(f"OOS start: {_oos_start.date()}  (Kalman warms up on full history before this)")
+if "test_end_date" in pairs.columns:
+    _oos_end   = pd.Timestamp(pairs["test_end_date"].iloc[0]).tz_localize("US/Eastern")
+
+if _oos_start and _oos_end:
+    print(f"OOS window: {_oos_start.date()} → {_oos_end.date()}  (point-in-time snapshot)")
+elif _oos_start:
+    print(f"OOS start: {_oos_start.date()}  (no test_end_date — open-ended OOS)")
 else:
-    print("WARNING: test_start_date not in pairs_selected.csv — running on full period (in-sample!)")
+    # Only printed when the pairs file lacks any OOS metadata, i.e. a legacy
+    # in-sample run. The OOS pipeline always provides both dates.
+    print("WARNING: no test_start_date in pairs file — running on full period (in-sample!)")
 
 print(f"Trading {len(pairs)} pairs | {closes.shape[0]} bars per ticker")
 print(f"Full data: {closes.index[0]} — {closes.index[-1]}")
 if _oos_start:
-    oos_bars = (closes.index >= _oos_start).sum()
+    mask = closes.index >= _oos_start
+    if _oos_end is not None:
+        mask &= closes.index <= _oos_end
+    oos_bars = int(mask.sum())
     print(f"OOS bars: {oos_bars} / {len(closes.index)}  ({oos_bars/len(closes.index)*100:.0f}% of total)")
 print(f"Pair max loss cutoff: {PAIR_MAX_LOSS}\n")
 
 # ── Run backtest per pair ─────────────────────────────────────────────────────
 pair_results = {}
+pair_zero_mtm_reports: dict[str, dict[str, object]] = {}
 zero_universe_rows: list[dict[str, object]] = []
 
 _exec_sim = ExecutionSimulator(
@@ -1415,6 +1910,7 @@ for pair_idx, (_, row) in enumerate(pairs.iterrows(), start=1):
                            hurst_filter=pair_hurst_f,
                            spread_daily=spread_daily,
                            oos_start=_oos_start,
+                           oos_end=_oos_end,
                            max_notional=pair_max_notl,
                            max_hold_bars=pair_half_life * 2,
                            session_window=_sessions.get(row["pair"]),
@@ -1486,14 +1982,20 @@ for pair_idx, (_, row) in enumerate(pairs.iterrows(), start=1):
         "zero_universe_ok": bool(zero_ok),
     })
 
-    if ACCOUNT_MODEL == "Zero" and not zero_ok:
+    if ACCOUNT_MODEL == "Zero" and not zero_ok and not BACKTEST_SMOKE:
         print(f"  SKIP {row['pair']}: Zero universe filter "
               f"(trade60={zero['max_trade_days_60d']}, profit60={zero['max_profit_days_60d']}, "
               f"trade30={zero['max_trade_days_30d']}, profit30={zero['max_profit_days_30d']}, "
               f"gap={zero['max_inactive_days']})")
         continue
+    if ACCOUNT_MODEL == "Zero" and not zero_ok and BACKTEST_SMOKE:
+        print(f"  WARN {row['pair']}: Zero universe filter would fail "
+              f"(trade60={zero['max_trade_days_60d']}, profit60={zero['max_profit_days_60d']}, "
+              f"trade30={zero['max_trade_days_30d']}, profit30={zero['max_profit_days_30d']}, "
+              f"gap={zero['max_inactive_days']})")
 
     pair_results[row["pair"]] = {"trades": real_trades, "signals": df_sig}
+    pair_zero_mtm_reports[row["pair"]] = dict(trades.attrs.get("zero_mtm", {}))
     hurst_blk = sum(1 for v in pair_hurst_f._cache.values() if v[0])
     hurst_tag = f"  H_blk={hurst_blk}" if hurst_blk > 0 else ""
     diag_tag = f"  blocks: {top_blocks}" if top_blocks else ""
@@ -1519,6 +2021,21 @@ if ACCOUNT_MODEL == "Zero":
         print(f"\nZero universe saved: {len(zero_df)} pairs -> {zero_path}")
 
 if not pair_results:
+    if AFES_ALLOW_EMPTY_RUN:
+        empty_trade_cols = [
+            "pair", "entry_time", "exit_time", "direction", "holding_bars",
+            "n_shares", "size", "gross_pnl", "tx_cost", "borrow_cost",
+            "net_pnl", "cum_pnl", "exit_reason", "entry_z", "exit_z",
+            "snapshot_id", "block_test_start", "block_test_end",
+        ]
+        empty_trades = pd.DataFrame(columns=empty_trade_cols)
+        save_with_parquet(empty_trades, DATA_DIR / "trades.csv", index=False)
+        research = build_research_report(empty_trades, _global_hmm_s)
+        zero_mtm = build_zero_mtm_report(empty_trades, pair_zero_mtm_reports, initial_capital=INITIAL_CAPITAL)
+        save_with_parquet(pd.DataFrame([research]), DATA_DIR / "research_report.csv", index=False)
+        save_with_parquet(pd.DataFrame([zero_mtm]), DATA_DIR / "zero_mtm_report.csv", index=False)
+        print("\nNo trades generated in this block (allowed). Wrote empty research and zero reports.")
+        raise SystemExit(0)
     raise SystemExit("No trades generated.")
 
 # ── Combine ───────────────────────────────────────────────────────────────────
@@ -1532,52 +2049,37 @@ if ACCOUNT_MODEL == "Zero":
         print(f"\nZero hard stop triggered: {zero_hard.get('breach')} — trimming later trades")
     # Refresh the saved trade stream and portfolio summary from the truncated history.
 
-pnl             = df_trades["net_pnl"]
-winning         = df_trades[pnl > 0]
-losing          = df_trades[pnl <= 0]
-stops           = df_trades[df_trades["exit_reason"] == "STOP"]
-coint_breaks    = df_trades[df_trades["exit_reason"] == "COINT_BREAK"]
-panic_exits     = df_trades[df_trades["exit_reason"] == "PANIC"]
-cumulative      = pnl.cumsum()
-max_drawdown    = (cumulative - cumulative.cummax()).min()
-days_total      = pd.to_datetime(df_trades["exit_time"].iloc[-1]) - pd.to_datetime(df_trades["exit_time"].iloc[0])
-trades_per_year = len(df_trades) / max(days_total.days / 365.25, 1 / 365.25)
-sharpe          = (pnl.mean() / pnl.std() * np.sqrt(trades_per_year)
-                   if pnl.std() > 0 else 0.0)
-profit_factor   = (winning["net_pnl"].sum() / abs(losing["net_pnl"].sum())
-                   if len(losing) > 0 and losing["net_pnl"].sum() != 0 else float("inf"))
-
 # ── Dollar P&L summary ───────────────────────────────────────────────────────
-dollar_net      = df_trades["dollar_pnl"].sum()
-dollar_gross    = df_trades["dollar_gross"].sum()
-dollar_costs    = df_trades["dollar_costs"].sum()
+research = build_research_report(df_trades, _global_hmm_s)
+zero_mtm = build_zero_mtm_report(df_trades, pair_zero_mtm_reports, initial_capital=INITIAL_CAPITAL)
+portfolio_pnl = pd.to_numeric(df_trades["net_pnl"], errors="coerce").fillna(0.0)
+cumulative = portfolio_pnl.cumsum()
+
+dollar_net      = float(research["total_pnl"])
+dollar_gross    = float(research["gross_pnl"])
+dollar_costs    = float(research["costs"])
 final_balance   = INITIAL_CAPITAL + dollar_net
 total_return    = dollar_net / INITIAL_CAPITAL * 100
+avg_dollar_trade = df_trades["dollar_pnl"].mean()
 dollar_drawdown = (df_trades["dollar_pnl"].cumsum()
                    - df_trades["dollar_pnl"].cumsum().cummax()).min()
-avg_dollar_trade = df_trades["dollar_pnl"].mean()
 
 print(f"\n{'='*60}")
-print(f"PORTFOLIO  ({len(pair_results)} pairs)  —  ${INITIAL_CAPITAL:,.0f} starting capital")
+print(f"RESEARCH REPORT  ({len(pair_results)} pairs)  —  ${INITIAL_CAPITAL:,.0f} starting capital")
 print(f"{'='*60}")
-print(f"Trades:        {len(df_trades)}  ({trades_per_year:.0f}/yr)")
-print(f"Win rate:      {len(winning)/len(df_trades)*100:.1f}%")
-print(f"Stops:         {len(stops)}")
-print(f"Coint breaks:  {len(coint_breaks)}")
-print(f"Panic exits:   {len(panic_exits)}")
-print(f"")
-print(f"Gross P&L:     ${dollar_gross:>+8.2f}   ({df_trades['gross_pnl'].sum():+.4f} spread units)")
-print(f"Costs:         ${dollar_costs:>8.2f}   ({(df_trades['tx_cost']+df_trades['borrow_cost']).sum():.4f} spread units)")
-print(f"Net P&L:       ${dollar_net:>+8.2f}   ({pnl.sum():+.4f} spread units)")
-print(f"")
+print(f"Trades:        {research['trades']}  ({research['trades_per_year']:.0f}/yr)")
+print(f"Hit rate:      {research['trade_hit_rate']:.1f}%")
+print(f"Gross P&L:     ${dollar_gross:>+8.2f}")
+print(f"Costs:         ${dollar_costs:>8.2f}")
+print(f"Net P&L:       ${dollar_net:>+8.2f}")
 print(f"Starting:      ${INITIAL_CAPITAL:>8,.2f}")
 print(f"Final balance: ${final_balance:>8,.2f}")
 print(f"Total return:  {total_return:>+7.2f}%")
-print(f"")
-print(f"Avg trade:     ${avg_dollar_trade:>+7.2f}   ({pnl.mean():+.4f} spread units)")
-print(f"Profit factor: {profit_factor:.2f}")
-print(f"Max drawdown:  ${dollar_drawdown:>8.2f}   ({max_drawdown:.4f} spread units)")
-print(f"Sharpe:        {sharpe:.2f}")
+print(f"Avg trade:     ${avg_dollar_trade:>+7.2f}")
+print(f"Profit factor: {research['profit_factor']:.2f}")
+print(f"Max drawdown:  ${dollar_drawdown:>8.2f}   ({research['max_drawdown']:.4f} spread units)")
+print(f"Daily Sharpe:  {research['daily_sharpe_annualized']:.2f}")
+print(f"Trade Sharpe:  {research['trade_sharpe_annualized']:.2f}  (diagnostic; inflated by high trade count)")
 print(f"Avg hold:      {df_trades['holding_bars'].mean():.0f} bars "
       f"({df_trades['holding_bars'].mean()/BARS_PER_TRADING_DAY:.1f} days)")
 
@@ -1591,26 +2093,27 @@ if "exit_reason" in df_trades.columns:
     print(f"Fill rate:     {fill_rate:.1%}  "
           f"(toxic_cancels={toxic_cancels}, limit_misses={limit_misses}, no_bar_after_latency={no_latency})")
 
-zero = zero_account_report(df_trades, INITIAL_CAPITAL)
 print(f"\n{'='*60}")
-print("FUNDINGPIPS ZERO CHECK (realized-exit approximation)")
+print("ZERO MTM REPORT")
 print(f"{'='*60}")
 print(f"Account size:      ${INITIAL_CAPITAL:,.0f}")
-print(f"Trailing loss 5%:   {'BREACH' if zero['trailing_loss_breached'] else 'OK'}")
-print(f"Daily loss 3%:      {'BREACH' if zero['daily_loss_breached'] else 'OK'}")
-print(f"30d trade days:     max {zero['max_trade_days_30d']} in any 30d window "
+print(f"Daily breach:      {'BREACH' if zero_mtm['daily_breach'] else 'OK'}")
+print(f"Trailing breach:    {'BREACH' if zero_mtm['trailing_breach'] else 'OK'}")
+print(f"Forced liquidations:{zero_mtm['forced_liquidation_count']}")
+print(f"Max liquidation DD: ${zero_mtm['max_liquidation_drawdown']:,.2f}")
+print(f"30d trade days:     max {zero_mtm['max_trade_days_30d']} in any 30d window "
       f"(need {ZERO_MIN_PROFIT_DAYS_30D})")
-print(f"30d profit days:    max {zero['max_profit_days_30d']} in any 30d window "
+print(f"30d profit days:    max {zero_mtm['max_profit_days_30d']} in any 30d window "
       f"(need {ZERO_MIN_PROFIT_DAYS_30D})")
-print(f"60d trade days:     max {zero['max_trade_days_60d']} in any 60d window "
+print(f"60d trade days:     max {zero_mtm['max_trade_days_60d']} in any 60d window "
       f"(need {ZERO_MIN_PROFIT_DAYS_60D})")
-print(f"60d profit days:    max {zero['max_profit_days_60d']} in any 60d window "
+print(f"60d profit days:    max {zero_mtm['max_profit_days_60d']} in any 60d window "
       f"(need {ZERO_MIN_PROFIT_DAYS_60D})")
-print(f"60d net P&L:        ${zero['max_60d_pnl']:,.2f}")
-if zero["max_inactive_days"] is not None:
-    print(f"Max inactivity gap: {zero['max_inactive_days']} days "
+print(f"60d net P&L:        ${zero_mtm['max_60d_pnl']:,.2f}")
+if zero_mtm["inactivity_days"] is not None:
+    print(f"Max inactivity gap: {zero_mtm['inactivity_days']} days "
           f"(limit {ZERO_MAX_INACTIVE_DAYS})")
-    print(f"Inactivity rule:    {'OK' if zero['max_inactive_days'] <= ZERO_MAX_INACTIVE_DAYS else 'FAIL'}")
+    print(f"Inactivity rule:    {'OK' if zero_mtm['inactivity_days'] <= ZERO_MAX_INACTIVE_DAYS else 'FAIL'}")
 
 print(f"\n{'─'*75}")
 print(f"{'Pair':<12} {'Trades':>6} {'WR':>6} {'Net $':>9} {'Net P&L':>10} {'Sharpe':>7} {'AvgHold':>8} {'Status':>10}")
@@ -1619,7 +2122,11 @@ for pair_name, data in pair_results.items():
     t  = data["trades"]
     p  = t["net_pnl"]
     wr = (p > 0).mean() * 100
-    tpy = len(t) / max(days_total.days / 365.25, 1 / 365.25)
+    pair_days = (
+        pd.to_datetime(t["exit_time"].iloc[-1])
+        - pd.to_datetime(t["exit_time"].iloc[0])
+    ).days if len(t) > 1 else 1
+    tpy = len(t) / max(pair_days / 365.25, 1 / 365.25)
     sh  = p.mean() / p.std() * np.sqrt(tpy) if p.std() > 0 else 0.0
     ah  = t["holding_bars"].mean() / BARS_PER_TRADING_DAY
     disabled  = t["cum_pnl"].iloc[-1] < PAIR_MAX_LOSS
@@ -1628,6 +2135,18 @@ for pair_name, data in pair_results.items():
     print(f"{pair_name:<12} {len(t):>6} {wr:>5.1f}% {dollar_p:>+8.2f}$ {p.sum():>+10.4f} "
           f"{sh:>7.2f} {ah:>6.1f}d {status:>10}")
 
+_RESEARCH_FORBIDDEN = {"daily_breach", "trailing_breach", "inactivity_breach", "inactivity_days",
+                       "profit_days_30_breach", "profit_days_60_breach",
+                       "forced_liquidation_count", "max_liquidation_drawdown"}
+_ZERO_FORBIDDEN = {"sharpe", "sharpe_annualized", "bootstrap", "hit_rate", "trade_hit_rate",
+                   "total_pnl", "gross_pnl"}
+_research_leak = _RESEARCH_FORBIDDEN & set(research.keys())
+_zero_leak = _ZERO_FORBIDDEN & set(zero_mtm.keys())
+assert not _research_leak, f"research_report leaks prop fields: {_research_leak}"
+assert not _zero_leak, f"zero_mtm_report leaks research fields: {_zero_leak}"
+
+save_with_parquet(pd.DataFrame([research]), DATA_DIR / "research_report.csv", index=False)
+save_with_parquet(pd.DataFrame([zero_mtm]), DATA_DIR / "zero_mtm_report.csv", index=False)
 save_with_parquet(df_trades, DATA_DIR / "trades.csv", index=False)
 print(f"\nSaved {len(df_trades)} trades to {DATA_DIR / 'trades.csv'}")
 
@@ -1677,12 +2196,14 @@ test_period = (pd.to_datetime(df_trades['exit_time'].iloc[-1])
 _oos_display = _oos_start.date() if _oos_start else closes.index[0].date()
 print(f"Test period:       {_oos_display} → {closes.index[-1].date()} "
       f"({test_period} days)")
-print(f"Strategy  Sharpe:  {sharpe:.2f}")
-print(f"Strategy  Net P&L: {pnl.sum():+.4f} (spread units)")
+strategy_sharpe = float(research["sharpe_annualized"])
+strategy_pnl = float(research["total_pnl"])
+print(f"Strategy  Sharpe:  {strategy_sharpe:.2f}")
+print(f"Strategy  Net P&L: {strategy_pnl:+.4f} (spread units)")
 if spy_return is not None:
     print(f"SPY       Return:  {spy_return:+.1f}%")
     print(f"SPY       Sharpe:  {spy_sharpe:.2f}")
-    alpha = sharpe - spy_sharpe
+    alpha = strategy_sharpe - spy_sharpe
     print(f"Alpha (Sharpe):    {alpha:+.2f}")
 
 if BACKTEST_SKIP_PLOTS:
@@ -1737,7 +2258,7 @@ else:
         ax.axhline(0, color="black", lw=0.8)
         ax.set_ylabel("Strategy return (%)", color="blue")
         ax2.set_ylabel("SPY return (%)", color="orange")
-        ax.set_title(f"Strategy vs SPY  |  Strategy Sharpe={sharpe:.2f}  "
+        ax.set_title(f"Strategy vs SPY  |  Strategy Sharpe={strategy_sharpe:.2f}  "
                      f"SPY Sharpe={spy_sharpe:.2f}")
 
         lines1, labels1 = ax.get_legend_handles_labels()

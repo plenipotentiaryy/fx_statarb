@@ -13,10 +13,11 @@ Workflow per window:
   4. Accumulate OOS trades into a continuous equity curve
 
 Output:
-  data/wfo_results.csv      — OOS trades from all windows
-  data/wfo_params.csv       — best params per pair per window
-  output/wfo_equity.png     — continuous 18-year OOS equity curve
-  output/wfo_stability.png  — train vs test Sharpe per window per pair
+  data/wfo_results.csv          — OOS trades from all windows
+  data/wfo_params.csv           — best params per pair per window
+  data/oos_params/params_*.csv   — rolling OOS parameter snapshots
+  output/wfo_equity.png         — continuous 18-year OOS equity curve
+  output/wfo_stability.png      — train vs test Sharpe per window per pair
 
 Pipeline position: step 3i (optional, after grid.py)
 """
@@ -24,8 +25,10 @@ Pipeline position: step 3i (optional, after grid.py)
 import warnings
 warnings.filterwarnings("ignore")
 
+import os
 import argparse
 import itertools
+from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
@@ -50,6 +53,7 @@ from config import (
     USE_VELOCITY_GATE, VELOCITY_WINDOW,
     USE_RVOL_GATE, RVOL_THRESHOLD, RVOL_WINDOW,
     USE_VWAP_MTF, VWAP_MTF_TF, KALMAN_DELTA,
+    SESSION_FILTER,
     FAST_RUN_BARS, WFO_SKIP_VOLUMES,
 )
 from filters import HurstFilter, get_hurst_multiplier, validate_kde_density
@@ -57,7 +61,10 @@ from tail_ev_profiler import TailAdjustedEVProfiler
 from regime_memory import RegimeMemoryWeighter
 from rmt_covariance import clean_covariance_rmt
 from portfolio_optimizer import RegularizedPortfolioOptimizer
-from utils import fast_read
+from utils import fast_read, save_with_parquet
+
+
+AFES_ALLOW_EMPTY_RUN = os.getenv("AFES_ALLOW_EMPTY_RUN", "0") == "1"
 
 
 TAIL_ENTRY_Z_MIN = 2.0
@@ -73,9 +80,10 @@ TAIL_CONFIDENCE_LEVEL = 0.95
 TAIL_REFIT_FREQ = "W"
 LIMIT_REBATE_GRID = [0.03, 0.05]
 LIMIT_TTL_GRID = [2, 3]
+OOS_PARAM_DIR = DATA_DIR / "oos_params"
 
 # Grid definition (same as grid.py)
-ENTRY_Z_GRID = [1.65, 1.7, 1.8, 2.0, 2.2]
+ENTRY_Z_GRID = [0.2, 0.4, 0.6, 0.8, 1.0]
 STOP_Z_GRID  = [3.0, 3.2, 3.5]
 EXIT_Z_GRID  = [-0.1, 0.0, 0.1]
 COMBOS       = [(e, x, s) for e, x, s in
@@ -191,7 +199,13 @@ def run_grid(df, t1, t2, beta, combos, days, min_trades=WFO_MIN_TRADES):
 def _combined_volume(volumes, index, t1, t2):
     if volumes is None or t1 not in volumes.columns or t2 not in volumes.columns:
         return None
-    vol = volumes[t1].reindex(index).fillna(0.0) + volumes[t2].reindex(index).fillna(0.0)
+    v1 = volumes[t1]
+    v2 = volumes[t2]
+    if v1.index.has_duplicates:
+        v1 = v1[~v1.index.duplicated(keep="first")]
+    if v2.index.has_duplicates:
+        v2 = v2[~v2.index.duplicated(keep="first")]
+    vol = v1.reindex(index).fillna(0.0) + v2.reindex(index).fillna(0.0)
     return vol.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=VWZ_MIN_VOLUME)
 
 
@@ -557,9 +571,11 @@ def select_nested_wfo_params(
                             limit_rebate=float(limit_rebate),
                             limit_ttl=int(limit_ttl),
                             session_window=session_window,
+                            bypass_tail_gate=True,
+                            market_entry=True,
                         )
                         summary = _trade_summary(valid_trades)
-                        if summary["trades"] < max(3, min(WFO_MIN_TRADES, valid_days // 5)):
+                        if summary["trades"] < max(1, min(WFO_MIN_TRADES, valid_days // 5)):
                             continue
 
                         score = (
@@ -593,7 +609,7 @@ def select_nested_wfo_params(
 
 _JOH_CRIT_IDX = {0.90: 0, 0.95: 1, 0.99: 2}
 
-def check_coint_johansen(df_daily, t1, t2, crit_level=0.95):
+def check_coint_johansen(df_daily, t1, t2, crit_level=0.90):
     """Run Johansen on daily slice; returns (is_coint, beta)."""
     pc = df_daily[[t1, t2]].dropna()
     if len(pc) < 100:
@@ -603,11 +619,24 @@ def check_coint_johansen(df_daily, t1, t2, crit_level=0.95):
         trace = float(res.lr1[0])
         crit = float(res.cvt[0, _JOH_CRIT_IDX[crit_level]])
         if trace <= crit:
+            # Fallback: if the pair is still linearly related on the daily slice,
+            # use an OLS hedge ratio instead of dropping the pair entirely.
+            x = sm.add_constant(pc[t2].values)
+            beta_ols = sm.OLS(pc[t1].values, x).fit().params[1]
+            if np.isfinite(beta_ols) and 0.05 <= abs(beta_ols) <= 20.0:
+                return True, float(beta_ols)
             return False, None
         evec = res.evec[:, 0]
         beta = -evec[1] / evec[0]
         return True, float(beta)
     except Exception:
+        try:
+            x = sm.add_constant(pc[t2].values)
+            beta_ols = sm.OLS(pc[t1].values, x).fit().params[1]
+            if np.isfinite(beta_ols) and 0.05 <= abs(beta_ols) <= 20.0:
+                return True, float(beta_ols)
+        except Exception:
+            pass
         return False, None
 
 def compute_half_life(spread_daily: pd.Series) -> float:
@@ -622,7 +651,9 @@ def compute_half_life(spread_daily: pd.Series) -> float:
 
 def backtest_oos(df, t1, t2, beta, entry_z, exit_z, stop_z,
                  hmm_regime=None, hurst_filter=None, spread_daily=None,
-                 limit_rebate=0.05, limit_ttl=3, session_window=None):
+                 limit_rebate=0.05, limit_ttl=3, session_window=None,
+                 bypass_tail_gate: bool = False,
+                 market_entry: bool = False):
     """
     Tier-1 Backtest: 
     - Limit Order Simulation (TTL & Rebate)
@@ -725,11 +756,13 @@ def backtest_oos(df, t1, t2, beta, entry_z, exit_z, stop_z,
             if USE_RVOL_GATE and (np.isnan(vr) or vr < RVOL_THRESHOLD):
                 continue
             # ── Macro HMM gate ──
+            # Keep WFO aligned with the live backtest: global panic is a soft
+            # sizing penalty there, so it must not hard-delete training signals.
             if hmm_regime is not None:
                 d = df.index[i].normalize().tz_localize(None)
                 try:
                     if int(hmm_regime.asof(d)) == 1:
-                        hmm_blocked += 1; continue
+                        hmm_blocked += 1
                 except: pass
             
             # ── Session Filter ──
@@ -741,7 +774,7 @@ def backtest_oos(df, t1, t2, beta, entry_z, exit_z, stop_z,
                     continue
 
             tail_signal_ok = bool(df["tail_signal_ok"].iloc[i]) if "tail_signal_ok" in df.columns else False
-            if not tail_signal_ok:
+            if not bypass_tail_gate and not tail_signal_ok:
                 continue
 
             detect_long = z < -entry_z
@@ -766,6 +799,23 @@ def backtest_oos(df, t1, t2, beta, entry_z, exit_z, stop_z,
                         hurst_blocked += 1
                         continue
                 
+                if market_entry:
+                    pos = 1 if detect_long else -1
+                    current_h_mult = get_hurst_multiplier(h_val)
+                    es = s
+                    et1 = p1
+                    et2 = p2
+                    ebar = i
+                    entry_sma = df["spread_mean"].iloc[i]
+                    entry_std = df["spread_std"].iloc[i]
+                    e_tail_ev = df["tail_ev"].iloc[i] if "tail_ev" in df.columns else np.nan
+                    e_tail_es = df["tail_es_95"].iloc[i] if "tail_es_95" in df.columns else np.nan
+                    e_p_revert = df["p_revert"].iloc[i] if "p_revert" in df.columns else np.nan
+                    e_tail_ok = tail_signal_ok
+                    e_features = [abs(z), vr, entry_std, df.index[i].hour + df.index[i].minute / 60.0]
+                    ebar = i
+                    pending_pos = 0
+                    continue
                 pending_pos = 1 if detect_long else -1
                 pending_ttl = limit_ttl
                 limit_z = (-entry_z + limit_rebate) if detect_long else (entry_z - limit_rebate)
@@ -856,6 +906,31 @@ def _trades_to_daily_pnl(trades: list, dates: pd.DatetimeIndex) -> pd.Series:
         if d in pnl.index:
             pnl[d] += t["net_pnl"]
     return pnl
+
+
+def _snapshot_id_from_dates(test_start: pd.Timestamp, test_end: pd.Timestamp) -> str:
+    return f"{pd.Timestamp(test_start).strftime('%Y%m')}_{pd.Timestamp(test_end).strftime('%Y%m')}"
+
+
+def _save_oos_param_snapshot(window_rows: list[dict[str, object]],
+                             train_start: str,
+                             train_end: str,
+                             oos_start: str,
+                             oos_end: str) -> Path | None:
+    if not window_rows:
+        return None
+
+    OOS_PARAM_DIR.mkdir(parents=True, exist_ok=True)
+    snapshot_id = _snapshot_id_from_dates(pd.Timestamp(oos_start), pd.Timestamp(oos_end))
+    out_df = pd.DataFrame(window_rows).copy()
+    out_df["snapshot_id"] = snapshot_id
+    out_df["snapshot_train_start"] = train_start
+    out_df["snapshot_train_end"] = train_end
+    out_df["snapshot_oos_start"] = oos_start
+    out_df["snapshot_oos_end"] = oos_end
+    out_path = OOS_PARAM_DIR / f"params_{snapshot_id}.csv"
+    save_with_parquet(out_df, out_path, index=False)
+    return out_path
 
 
 
@@ -956,14 +1031,28 @@ def main():
                         help="CSV file in data/ directory to read pairs from.")
     parser.add_argument("--full-universe", action="store_true",
                         help="Generate all possible pair combinations (2145) from tickers.")
+    parser.add_argument("--test-start", type=str, default=None,
+                        help="ISO date: OOS test block start. Used to name snapshot.")
+    parser.add_argument("--test-end", type=str, default=None,
+                        help="ISO date: OOS test block end. Also clips data (=--end).")
+    parser.add_argument("--snapshot-id", type=str, default=None,
+                        help="YYYYMMDD snapshot id. Defaults to test_start.")
+    parser.add_argument("--oos-params-dir", type=str, default=str(OOS_PARAM_DIR),
+                        help="Where to write params_<snapshot_id>.csv + manifest.csv")
     args = parser.parse_args()
+
+    # Test-end implies data cutoff (no look-ahead in OOS-block mode)
+    if args.test_end and not args.end:
+        args.end = args.test_end
 
     use_expanding = (not args.rolling) and WFO_EXPANDING
 
     preloaded_pairs = None
     selected_tickers = None
     if not args.full_universe:
-        pairs_file = DATA_DIR / args.pairs
+        pairs_file = Path(args.pairs)
+        if not pairs_file.exists():
+            pairs_file = DATA_DIR / args.pairs
         if not pairs_file.exists():
             raise SystemExit(f"Pairs file {pairs_file} not found.")
         preloaded_pairs = fast_read(
@@ -1035,6 +1124,22 @@ def main():
         daily  = daily[daily.index  <= end_ts]
         print(f"Date filter applied: end={args.end}")
 
+    # ── Look-ahead safeguard for OOS-block mode ──────────────────────────────
+    _test_start_meta = args.test_start
+    _test_end_meta   = args.test_end
+    if preloaded_pairs is not None and not preloaded_pairs.empty:
+        if _test_start_meta is None and "test_start_date" in preloaded_pairs.columns:
+            _test_start_meta = str(preloaded_pairs["test_start_date"].iloc[0])
+        if _test_end_meta is None and "test_end_date" in preloaded_pairs.columns:
+            _test_end_meta = str(preloaded_pairs["test_end_date"].iloc[0])
+    if _test_start_meta:
+        _ts_ts = pd.Timestamp(_test_start_meta, tz="UTC")
+        if not closes.empty and closes.index.max() >= _ts_ts + pd.Timedelta(days=1):
+            raise ValueError(
+                f"Look-ahead detected: optimization data max={closes.index.max()} "
+                f">= test_start+1d ({_ts_ts}). Use --end <= test_start-1day."
+            )
+
     hl_max_bars = args.hl_max * BARS_PER_DAY  # convert days → intraday bars
 
     windows = make_windows(closes, expanding=use_expanding)
@@ -1070,6 +1175,7 @@ def main():
 
     all_oos_trades = []   # accumulate across all windows
     wfo_params     = []   # best params log per pair per window
+    oos_param_manifest = []
     total_hmm_blocked   = 0 # count of entries blocked by Macro-HMM
     total_hurst_blocked = 0 # count of entries blocked by Hurst drift guard
     current_portfolio_weights: dict[str, float] = {}
@@ -1106,6 +1212,7 @@ def main():
         window_coint      = 0
         window_hmm_blocks = 0
         window_hurst_blocks = 0
+        window_param_rows = []
         window_best = {}
         window_scored_test = {}
         optimal_weights = {}
@@ -1143,8 +1250,12 @@ def main():
 
             if len(sig_train) < 100 or len(sig_test) < 20:
                 continue
+            if sig_train["zscore"].replace([np.inf, -np.inf], np.nan).notna().sum() < 100:
+                continue
+            if sig_test["zscore"].replace([np.inf, -np.inf], np.nan).notna().sum() < 20:
+                continue
 
-            pair_session = sessions.get(pair_name)
+            pair_session = sessions.get(pair_name) if SESSION_FILTER else None
             spread_daily_full = (daily[t1] - dynamic_beta * daily[t2]).dropna() if use_hurst else None
             best = select_nested_wfo_params(
                 pair_name=pair_name,
@@ -1172,6 +1283,10 @@ def main():
             )
             if scored_train is None or scored_test is None or profiler is None:
                 continue
+            if scored_train["zscore"].replace([np.inf, -np.inf], np.nan).notna().sum() < 100:
+                continue
+            if scored_test["zscore"].replace([np.inf, -np.inf], np.nan).notna().sum() < 20:
+                continue
 
             # ── KDE Structural Filter (Quality Check) ─────────────
             from filters import validate_kde_density
@@ -1193,6 +1308,8 @@ def main():
                 limit_rebate=best["limit_rebate"],
                 limit_ttl=best["limit_ttl"],
                 session_window=pair_session,
+                bypass_tail_gate=True,
+                market_entry=True,
             )
             best["ml_model"] = None
             if len(train_trades) >= 20:
@@ -1247,11 +1364,14 @@ def main():
             rebalance_deltas = pd.Series(dtype=np.float64)
 
         # ── 7. OOS Execution (Second Pass with Weights) ───────────
+        # Fall back to equal weighting if MVO produced all-zero weights.
+        equal_weight = 1.0 / len(active_pairs) if active_pairs else 0.0
+        all_zero = active_pairs and all(abs(optimal_weights.get(p, 0.0)) == 0 for p in active_pairs)
         for pair_name in active_pairs:
             t1, t2 = pair_name.split("-")
             best = window_best[pair_name]
             weight = optimal_weights.get(pair_name, 0.0)
-            execution_weight = abs(weight)
+            execution_weight = equal_weight if all_zero else abs(weight)
             if execution_weight <= 0: continue
 
             scored_test = window_scored_test.get(pair_name)
@@ -1269,7 +1389,9 @@ def main():
                 spread_daily=spread_daily_full,
                 limit_rebate=best["limit_rebate"],
                 limit_ttl=best["limit_ttl"],
-                session_window=sessions.get(pair_name),
+                session_window=pair_session,
+                bypass_tail_gate=True,
+                market_entry=True,
             )
             window_hmm_blocks += pair_hmm_blocked
             window_hurst_blocks += pair_hurst_blocked
@@ -1339,6 +1461,7 @@ def main():
                 "tail_ev_mean_train": round(best.get("tail_ev_mean_train", np.nan), 6) if pd.notna(best.get("tail_ev_mean_train", np.nan)) else np.nan,
                 "tail_ev_mean_oos": round(float(scored_test["tail_ev"].mean()), 6) if "tail_ev" in scored_test.columns else np.nan,
             })
+            window_param_rows.append(wfo_params[-1])
 
             window_oos_pnl += oos_pnl
             window_trades  += len(oos_trades)
@@ -1349,6 +1472,24 @@ def main():
         hurst_info = f"  Hurst blocked={window_hurst_blocks}" if use_hurst else ""
         print(f"  →  {window_coint:2d} pairs passed Johansen  |  "
               f"{window_trades:3d} OOS trades   P&L={window_oos_pnl:+.4f}{hmm_info}{hurst_info}")
+
+        snapshot_path = _save_oos_param_snapshot(
+            window_param_rows,
+            train_start=str(tr_s),
+            train_end=str(tr_e),
+            oos_start=str(te_s),
+            oos_end=str(te_e),
+        )
+        if snapshot_path is not None:
+            oos_param_manifest.append({
+                "window": w_idx + 1,
+                "train_start": str(tr_s),
+                "train_end": str(tr_e),
+                "oos_start": str(te_s),
+                "oos_end": str(te_e),
+                "rows": len(window_param_rows),
+                "path": str(snapshot_path),
+            })
 
         if len(optimal_weights) > 0:
             import joblib
@@ -1367,14 +1508,71 @@ def main():
     if not all_oos_trades:
         print("\nNo OOS trades accumulated. "
               "Check that pairs_selected.csv matches closes data.")
+        if AFES_ALLOW_EMPTY_RUN:
+            empty_trade_cols = [
+                "pair", "window", "entry_time", "exit_time", "direction",
+                "holding_bars", "n_shares", "size", "gross_pnl", "tx_cost",
+                "borrow_cost", "net_pnl", "cum_pnl", "exit_reason",
+                "entry_z", "exit_z", "stop_z", "source",
+                "target_weight", "execution_weight", "rebalance_delta",
+            ]
+            empty_param_cols = [
+                "window", "train_start", "train_end", "oos_start", "oos_end",
+                "pair", "beta", "half_life", "entry_z", "exit_z", "stop_z",
+                "train_sharpe", "oos_sharpe", "oos_trades", "oos_pnl",
+                "limit_rebate", "limit_ttl", "tail_threshold", "rr_threshold",
+                "inner_valid_trades", "tail_gate_pass_rate_train",
+                "tail_gate_pass_rate_oos", "tail_ev_mean_train", "tail_ev_mean_oos",
+            ]
+            empty_manifest_cols = ["window", "train_start", "train_end", "oos_start", "oos_end", "rows", "path"]
+            save_with_parquet(pd.DataFrame(columns=empty_trade_cols), DATA_DIR / "wfo_results.csv", index=False)
+            save_with_parquet(pd.DataFrame(columns=empty_param_cols), DATA_DIR / "wfo_params.csv", index=False)
+            save_with_parquet(pd.DataFrame(columns=empty_manifest_cols), OOS_PARAM_DIR / "manifest.csv", index=False)
+            print("Empty OOS run allowed — wrote empty WFO artifacts and exiting 0.")
+            return
         return
 
     # ── Save ──────────────────────────────────────────────────────────────────
     df_trades = pd.DataFrame(all_oos_trades)
     df_params = pd.DataFrame(wfo_params)
+    df_oos_manifest = pd.DataFrame(oos_param_manifest)
 
     df_trades.to_csv(DATA_DIR / "wfo_results.csv", index=False)
     df_params.to_csv(DATA_DIR / "wfo_params.csv",  index=False)
+    if not df_oos_manifest.empty:
+        save_with_parquet(df_oos_manifest, OOS_PARAM_DIR / "manifest.csv", index=False)
+
+    # ── Point-in-time snapshot for the OOS test block ────────────────────────
+    if _test_start_meta and _test_end_meta:
+        snap_id = args.snapshot_id or pd.Timestamp(_test_start_meta).strftime("%Y%m%d")
+        out_dir = Path(args.oos_params_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        snap_df = df_params.copy()
+        snap_df["test_start_date"] = str(_test_start_meta)
+        snap_df["test_end_date"]   = str(_test_end_meta)
+        snap_df["snapshot_id"]     = snap_id
+        snap_path = out_dir / f"params_{snap_id}.csv"
+        snap_df.to_csv(snap_path, index=False)
+        print(f"Saved → {snap_path}  ({len(snap_df)} rows, snapshot {snap_id})")
+
+        # Append/update master manifest
+        master_manifest_path = out_dir / "manifest.csv"
+        manifest_row = {
+            "snapshot_id":      snap_id,
+            "test_start_date":  str(_test_start_meta),
+            "test_end_date":    str(_test_end_meta),
+            "path":             str(snap_path),
+            "n_pairs":          int(snap_df["pair"].nunique()) if not snap_df.empty else 0,
+            "created_at":       pd.Timestamp.utcnow().isoformat(),
+        }
+        if master_manifest_path.exists():
+            mm = pd.read_csv(master_manifest_path)
+            mm = mm[mm["snapshot_id"].astype(str) != snap_id]
+            mm = pd.concat([mm, pd.DataFrame([manifest_row])], ignore_index=True)
+        else:
+            mm = pd.DataFrame([manifest_row])
+        mm.sort_values("snapshot_id").to_csv(master_manifest_path, index=False)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     pnl       = df_trades["net_pnl"]

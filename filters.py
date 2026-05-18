@@ -160,19 +160,19 @@ class MacroFilter:
             return True
         if self._km and self._km.get(d, 1) == 2:  # K-Means: only Panic=2 blocks
             return True
-        if self._hmm.get(d, 0) == 1:           # global SPY HMM panic
-            return True
+        # Global HMM panic → soft size cut (HMM_PANIC_MULT), not hard block.
+        # Hard block kills all entries in 34% of calendar days — zero trades.
         return False
 
     def km_size_multiplier(self, ts) -> float:
-        """Soft position size scaling by K-Means regime."""
+        """Soft position size scaling by K-Means + global HMM panic."""
+        from config import HMM_PANIC_MULT
         d = _to_date(ts)
         regime = self._km.get(d, 1)
-        if regime == 1:
-            return 1.0
-        if regime == 0:
-            return 0.5
-        return 0.0
+        mult = 1.0 if regime == 1 else (0.5 if regime == 0 else 0.0)
+        if self._hmm.get(d, 0) == 1:
+            mult *= HMM_PANIC_MULT  # HMM panic: soft cut, not hard block
+        return mult
 
     def is_force_close(self, ts) -> bool:
         """True → immediately close any open position on this bar."""
