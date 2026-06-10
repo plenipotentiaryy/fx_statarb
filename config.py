@@ -108,11 +108,22 @@ RVOL_THRESHOLD   = 0.60    # looser gate: keep thin-market protection without st
 RVOL_WINDOW      = 200     # ~3.3 hours rolling baseline for "normal" volume
 
 # ── Volume Zones (HVN/LVN profile) ───────────────────────────────────────────
-# Trade only where the spread spent the most volume (HVN — acceptance/range) OR
-# only at the thin extremes (LVN — rejection/snapback). Volume comes from CME FX
-# futures if data/futures_volumes_*.parquet exists, else Dukascopy tick volume.
+# Empirical finding (step3k_volume_zones.py): for a MEAN-REVERTING spread the
+# volume piles up at the mean (HVN = POC = the reversion TARGET) and the entry
+# extremes sit in thin/NEUTRAL territory — so a static "enter only in an HVN bin"
+# gate is inert. The two genuinely actionable signals are:
+#   1. MAGNET STRENGTH (per-pair): how concentrated volume is in the value area.
+#      A strong magnet → reliable pull back to the mean → trade the pair.
+#   2. ACCEPTANCE vs REJECTION at the extreme (per-bar): is volume BUILDING as the
+#      spread reaches the extreme (acceptance → breakout risk) or DRYING UP
+#      (rejection → snapback). Measured by relative volume (rvol) at the trigger.
+# Volume comes from CME FX futures if data/futures_volumes_*.parquet exists, else
+# Dukascopy tick volume.
 USE_VOLUME_ZONES   = False   # master switch — keep OFF until zones are profiled
-ZONE_MODE          = "HVN"   # "HVN" = fade acceptance | "LVN" = fade rejection
+ZONE_MODE          = "REJECT"  # "REJECT" = fade drying extremes (rvol low) |
+                               # "ACCEPT"  = fade churning extremes (rvol high)
+ZONE_RVOL_SPLIT    = 1.0     # rvol <= split → drying (REJECT bucket); > split → building
+ZONE_MIN_MAGNET    = 0.0     # per-pair gate: skip pairs with value-area vol share below this
 VOLUME_ZONE_BINS   = 60      # histogram resolution of the Volume-at-Z profile
 VOLUME_ZONE_VA_PCT = 0.70    # value-area fraction (classic Market Profile = 70%)
 VOLUME_ZONE_HVN_Q  = 0.80    # bins above this volume-quantile are High-Volume Nodes

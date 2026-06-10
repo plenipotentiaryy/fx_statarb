@@ -32,7 +32,8 @@ from config import (
     ENTRY_Z_MIN,
     HURST_GUARDED_ENTRY_ADD, HURST_GUARDED_EXIT_Z,
     WFO_SKIP_VOLUMES,
-    USE_VOLUME_ZONES, ZONE_MODE, VOLUME_ZONE_BINS, VOLUME_ZONE_VA_PCT,
+    USE_VOLUME_ZONES, ZONE_MODE, ZONE_RVOL_SPLIT,
+    VOLUME_ZONE_BINS, VOLUME_ZONE_VA_PCT,
     VOLUME_ZONE_HVN_Q, VOLUME_ZONE_LVN_Q, VOLUME_ZONE_WINDOW, VOLUME_ZONE_STEP,
     USE_LVN_STOP, LVN_STOP_Z_MIN, LVN_STOP_Z_MAX,
 )
@@ -840,15 +841,22 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                         position = 0
                         continue
 
-                # ── Volume-Zone gate: trade only in the chosen node type ──
-                # HVN mode: fade extremes sitting in a high-volume acceptance
-                # zone (range). LVN mode: fade extremes in a thin rejection zone
-                # (snapback to value). Warm-up bars (no profile yet) are blocked.
-                if USE_VOLUME_ZONES and "zone" in df.columns:
-                    zone_val = df["zone"].iloc[i]
-                    allowed = ({"HVN"} if ZONE_MODE == "HVN"
-                               else {"LVN", "OUTSIDE"})
-                    if zone_val not in allowed:
+                # ── Volume-Zone gate: acceptance vs rejection at the extreme ──
+                # For a mean-reverting spread the entry extreme is never an HVN, so
+                # the edge is in the VOLUME BEHAVIOUR at the extreme, read from rvol:
+                #   REJECT mode → fade only when volume is DRYING (rvol <= split):
+                #     the move is being rejected → snapback to the mean is likely.
+                #   ACCEPT mode → fade only when volume is BUILDING (rvol > split):
+                #     price is churning at the level (range), revert within value.
+                # The static HVN/LVN profile is retained only for the LVN stop below.
+                if USE_VOLUME_ZONES and "rvol" in df.columns:
+                    rv = df["rvol"].iloc[i]
+                    if np.isnan(rv):
+                        diag["volume_zone"] += 1
+                        position = 0
+                        continue
+                    drying = rv <= ZONE_RVOL_SPLIT
+                    if (ZONE_MODE == "REJECT") != drying:
                         diag["volume_zone"] += 1
                         position = 0
                         continue

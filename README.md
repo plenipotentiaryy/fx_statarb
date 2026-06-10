@@ -157,13 +157,26 @@ each level **HVN** (high-volume node = acceptance/value, price reverts) or **LVN
 python step3k_volume_zones.py     # → data/volume_zones.csv + output/volume_zones/*.png
 ```
 
-It reports the mean-reversion edge of entries triggered in HVN vs LVN so you can pick
-`ZONE_MODE`. Wire it into the backtest via `config.py`:
+**Empirical finding** (from running the profiler): for a *mean-reverting spread* the
+volume piles up at the mean — the **HVN is the POC = the reversion target**, while the
+entry extremes sit in thin/NEUTRAL territory. So "enter only inside an HVN bin" is
+inert. The two signals that actually carry an edge are:
+
+* **Magnet strength** (per-pair): the share of volume inside the value area. A strong
+  magnet ⇒ the spread is pulled back hard ⇒ reversion is reliable ⇒ trade the pair.
+* **Acceptance vs rejection at the extreme** (per-bar): is volume *building* as the
+  spread reaches the extreme (acceptance → breakout risk) or *drying up* (rejection →
+  snapback)? Read from relative volume (`rvol`) at the trigger.
+
+The **LVN nodes sit at the far tails (|Z|≈2.9–3.1)** — exactly the right place for a
+stop, which validates `USE_LVN_STOP`. Wire it into the backtest via `config.py`:
 
 | Flag | Purpose |
 |---|---|
 | `USE_VOLUME_ZONES` | master switch (default `False`) |
-| `ZONE_MODE` | `"HVN"` fade acceptance / `"LVN"` fade rejection |
+| `ZONE_MODE` | `"REJECT"` fade drying extremes / `"ACCEPT"` fade churning extremes |
+| `ZONE_RVOL_SPLIT` | rvol boundary between drying (≤) and building (>) |
+| `ZONE_MIN_MAGNET` | skip pairs whose value-area volume share is too low |
 | `USE_LVN_STOP` | park the stop just beyond the nearest LVN (vacuum) |
 
 ---

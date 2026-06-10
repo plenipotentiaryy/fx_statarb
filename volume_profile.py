@@ -102,6 +102,36 @@ class VolumeProfile:
         cand = np.where(lvn & (self.centers < x))[0]
         return float(self.centers[cand[-1]]) if cand.size else None
 
+    # ── Magnet strength ───────────────────────────────────────────────────────
+    # For a mean-reverting SPREAD the volume mass piles up at the mean (the POC),
+    # so the tradeable "trade in the most-traded zone" signal is not where the
+    # *entry extreme* sits but how strong the POC magnet is: the more volume is
+    # concentrated inside the value area, the harder the spread is pulled back to
+    # the mean → the more reliable the reversion. These are per-pair quality metrics.
+
+    @property
+    def total_volume(self) -> float:
+        return float(self.vol.sum())
+
+    @property
+    def va_volume_share(self) -> float:
+        """Fraction of total volume that sits inside the value area (0..1)."""
+        if self.total_volume <= 0:
+            return 0.0
+        in_va = (self.centers >= self.va_low) & (self.centers <= self.va_high)
+        return float(self.vol[in_va].sum() / self.total_volume)
+
+    @property
+    def poc_dominance(self) -> float:
+        """Peakedness of the magnet: max-bin volume ÷ mean bin volume.
+
+        ~1 = flat profile (weak magnet); large = sharply-peaked (strong magnet).
+        """
+        nz = self.vol[self.vol > 0]
+        if nz.size == 0:
+            return 0.0
+        return float(self.vol.max() / nz.mean())
+
 
 # ── Profile builder ───────────────────────────────────────────────────────────
 
