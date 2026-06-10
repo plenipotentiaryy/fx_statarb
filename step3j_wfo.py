@@ -55,6 +55,7 @@ from config import (
     USE_VWAP_MTF, VWAP_MTF_TF, KALMAN_DELTA,
     SESSION_FILTER,
     FAST_RUN_BARS, WFO_SKIP_VOLUMES,
+    ZONE_RVOL_SPLIT,
 )
 from filters import HurstFilter, get_hurst_multiplier, validate_kde_density
 from tail_ev_profiler import TailAdjustedEVProfiler
@@ -104,9 +105,12 @@ from numba import njit
 
 @njit
 def _grid_kernel(zscore, spread, velocity, rvol, sv_mtf, t1_p, t2_p,
-                 entry_arr, exit_arr, stop_arr,
+                 entry_arr, exit_arr, stop_arr, zone_arr,
                  beta, cost_taker, borrow_rate, bars_per_day,
-                 use_vel_gate, use_rvol_gate, rvol_thresh, use_vwap_mtf):
+                 use_vel_gate, use_rvol_gate, rvol_thresh, use_vwap_mtf,
+                 rvol_split):
+    # zone_arr[c]: per-combo volume-zone mode — 0 = OFF, 1 = REJECT (fade drying
+    # extremes, rvol <= split), 2 = ACCEPT (fade churning extremes, rvol > split).
     n_bars, n_c = len(zscore), len(entry_arr)
     pos   = np.zeros(n_c, dtype=numba.int64)
     e_sp  = np.zeros(n_c); e_bar = np.zeros(n_c, dtype=numba.int64)
@@ -115,7 +119,7 @@ def _grid_kernel(zscore, spread, velocity, rvol, sv_mtf, t1_p, t2_p,
     for i in range(n_bars):
         z = zscore[i]; s = spread[i]; v = velocity[i]
         rv = rvol[i]; vwap = sv_mtf[i]
-        
+
         for c in range(n_c):
             ez, xz, sz, pc = entry_arr[c], exit_arr[c], stop_arr[c], pos[c]
             
@@ -142,6 +146,12 @@ def _grid_kernel(zscore, spread, velocity, rvol, sv_mtf, t1_p, t2_p,
 
             if pos[c] == 0:
                 if use_rvol_gate and (np.isnan(rv) or rv < rvol_thresh): continue
+                zm = zone_arr[c]
+                if zm != 0:
+                    if np.isnan(rv): continue
+                    drying = rv <= rvol_split
+                    # REJECT(1) needs drying; ACCEPT(2) needs building. Skip otherwise.
+                    if (zm == 1) != drying: continue
                 if z < -ez:
                     if use_vel_gate and (np.isnan(v) or v < 0): continue
                     if use_vwap_mtf and not np.isnan(vwap) and s < vwap: continue
@@ -153,8 +163,15 @@ def _grid_kernel(zscore, spread, velocity, rvol, sv_mtf, t1_p, t2_p,
     return res
 
 
-def run_grid(df, t1, t2, beta, combos, days, min_trades=WFO_MIN_TRADES):
-    """Run grid search. Returns best row (entry_z, exit_z, stop_z, sharpe) or None."""
+def run_grid(df, t1, t2, beta, combos, days, min_trades=WFO_MIN_TRADES,
+             zone_mode=0, rvol_split=ZONE_RVOL_SPLIT):
+    """Run grid search. Returns best row (entry_z, exit_z, stop_z, sharpe) or None.
+
+    zone_mode: 0 = no volume-zone gate (default, behaviour unchanged),
+               1 = REJECT (enter only when rvol <= rvol_split — drying extreme),
+               2 = ACCEPT (enter only when rvol >  rvol_split — churning extreme).
+    The same mode is applied to every combo in this call.
+    """
     valid = [(e, x, s) for e, x, s in combos if s > e and x < e]
     if not valid or len(df) < 50:
         return None
@@ -162,6 +179,7 @@ def run_grid(df, t1, t2, beta, combos, days, min_trades=WFO_MIN_TRADES):
     ea = np.array([c[0] for c in valid], dtype=np.float64)
     xa = np.array([c[1] for c in valid], dtype=np.float64)
     sa = np.array([c[2] for c in valid], dtype=np.float64)
+    za = np.full(len(valid), int(zone_mode), dtype=np.int64)
 
     res = _grid_kernel(
         np.ascontiguousarray(df["zscore"].to_numpy(np.float64)),
@@ -171,9 +189,10 @@ def run_grid(df, t1, t2, beta, combos, days, min_trades=WFO_MIN_TRADES):
         np.ascontiguousarray(df["spread_vwap_mtf"].to_numpy(np.float64)) if "spread_vwap_mtf" in df.columns else np.full(len(df), np.nan),
         np.ascontiguousarray(df[f"{t1}_close"].to_numpy(np.float64)),
         np.ascontiguousarray(df[f"{t2}_close"].to_numpy(np.float64)),
-        ea, xa, sa, float(beta),
+        ea, xa, sa, za, float(beta),
         float(COST_TAKER), float(BORROW_RATE_ANNUAL), float(BARS_PER_DAY),
-        bool(USE_VELOCITY_GATE), bool(USE_RVOL_GATE), float(RVOL_THRESHOLD), bool(USE_VWAP_MTF)
+        bool(USE_VELOCITY_GATE), bool(USE_RVOL_GATE), float(RVOL_THRESHOLD), bool(USE_VWAP_MTF),
+        float(rvol_split),
     )
 
     years = max(days / 365.25, 1e-9)
@@ -190,6 +209,7 @@ def run_grid(df, t1, t2, beta, combos, days, min_trades=WFO_MIN_TRADES):
         if sh > best_sh:
             best_sh  = sh
             best_row = {"entry_z": ez, "exit_z": xz, "stop_z": sz,
+                        "zone_mode": int(zone_mode),
                         "sharpe": round(sh, 3), "trades": n,
                         "win_rate": round(res[i, 2] / n * 100, 1),
                         "total_pnl": round(res[i, 0], 4)}
