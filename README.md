@@ -127,12 +127,44 @@ final_size = base_size
 |---|---|---|
 | Polygon.io | 15-min intraday OHLCV | Signals, backtest |
 | Yahoo Finance | Daily closes (20 yr) | Pair selection |
+| Dukascopy | 1-min OHLCV + **tick volume** | Spread, VW-Z, RVOL |
+| **CME FX futures** (Databento) | Real exchange **volume** (6E, 6B, 6J…) | **Volume zones (HVN/LVN)** |
 
 Set your Polygon API key in `.env`:
 
 ```
 POLYGON_API_KEY=your_key_here
 ```
+
+---
+
+## Volume Zones (HVN / LVN) — where the "volume" comes from
+
+Spot FX is OTC and has **no consolidated traded volume**. The zone engine is
+source-agnostic and resolves volume in priority order (`volume_profile.pick_volume_source`):
+
+1. **CME FX futures volume** — REAL exchange volume, the gold standard. Pull it with
+   `python download_futures_volume.py` (needs `DATABENTO_API_KEY`); `futures_map.py` maps
+   `6E↔eurusd`, `6B↔gbpusd`, `6J↔usdjpy`, … back onto the spot pairs.
+2. **Dukascopy tick volume** — the `V` column already in `volumes_*.parquet`; a
+   ~0.85–0.90 correlated proxy that works out-of-the-box on majors.
+
+Both feed one engine that builds a **Volume-at-Z profile** of the spread and labels
+each level **HVN** (high-volume node = acceptance/value, price reverts) or **LVN**
+(low-volume node = rejection, price runs through):
+
+```bash
+python step3k_volume_zones.py     # → data/volume_zones.csv + output/volume_zones/*.png
+```
+
+It reports the mean-reversion edge of entries triggered in HVN vs LVN so you can pick
+`ZONE_MODE`. Wire it into the backtest via `config.py`:
+
+| Flag | Purpose |
+|---|---|
+| `USE_VOLUME_ZONES` | master switch (default `False`) |
+| `ZONE_MODE` | `"HVN"` fade acceptance / `"LVN"` fade rejection |
+| `USE_LVN_STOP` | park the stop just beyond the nearest LVN (vacuum) |
 
 ---
 

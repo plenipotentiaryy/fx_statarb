@@ -32,8 +32,12 @@ from config import (
     ENTRY_Z_MIN,
     HURST_GUARDED_ENTRY_ADD, HURST_GUARDED_EXIT_Z,
     WFO_SKIP_VOLUMES,
+    USE_VOLUME_ZONES, ZONE_MODE, VOLUME_ZONE_BINS, VOLUME_ZONE_VA_PCT,
+    VOLUME_ZONE_HVN_Q, VOLUME_ZONE_LVN_Q, VOLUME_ZONE_WINDOW, VOLUME_ZONE_STEP,
+    USE_LVN_STOP, LVN_STOP_Z_MIN, LVN_STOP_Z_MAX,
 )
 from kalman import kalman_hedge
+from volume_profile import build_rolling_zone_series
 from step3e_sizing import (
     load_regimes, load_iv, load_global_hmm, load_mc_confidence,
     iv_multiplier_series, position_size,
@@ -299,6 +303,24 @@ def build_signals(closes, t1, t2, beta, half_life,
     else:
         spread_vwap_mtf = pd.Series(np.nan, index=closes.index)
 
+    # ── Volume zones: causal HVN/LVN profile of the spread Z ─────────────────
+    # Built only from PAST bars (trailing window, rebuilt every STEP bars), so
+    # the zone label and LVN-stop levels carry no look-ahead. Weighted by combined
+    # volume — REAL CME futures volume when available, else tick-volume proxy.
+    if USE_VOLUME_ZONES and vol is not None:
+        zone_df = build_rolling_zone_series(
+            zscore, vol,
+            window=VOLUME_ZONE_WINDOW, step=VOLUME_ZONE_STEP,
+            n_bins=VOLUME_ZONE_BINS, va_pct=VOLUME_ZONE_VA_PCT,
+            hvn_q=VOLUME_ZONE_HVN_Q, lvn_q=VOLUME_ZONE_LVN_Q,
+        )
+    else:
+        zone_df = pd.DataFrame({
+            "zone": pd.Series(index=closes.index, dtype="object"),
+            "lvn_up": pd.Series(np.nan, index=closes.index),
+            "lvn_down": pd.Series(np.nan, index=closes.index),
+        })
+
     copula_df = pd.DataFrame(index=closes.index)
     if USE_COPULA:
         copula_df = compute_copula_signals(p1, p2, COPULA_WINDOW)
@@ -319,6 +341,9 @@ def build_signals(closes, t1, t2, beta, half_life,
         "spread_vwap_mtf": spread_vwap_mtf,
         "innov_var":       innov_var,
         "innov_var_ratio": innov_var_ratio,
+        "zone":            zone_df["zone"],
+        "lvn_up":          zone_df["lvn_up"],
+        "lvn_down":        zone_df["lvn_down"],
     })
     if USE_COPULA and not copula_df.empty:
         out = out.join(copula_df, how="left")
@@ -815,6 +840,19 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                         position = 0
                         continue
 
+                # ── Volume-Zone gate: trade only in the chosen node type ──
+                # HVN mode: fade extremes sitting in a high-volume acceptance
+                # zone (range). LVN mode: fade extremes in a thin rejection zone
+                # (snapback to value). Warm-up bars (no profile yet) are blocked.
+                if USE_VOLUME_ZONES and "zone" in df.columns:
+                    zone_val = df["zone"].iloc[i]
+                    allowed = ({"HVN"} if ZONE_MODE == "HVN"
+                               else {"LVN", "OUTSIDE"})
+                    if zone_val not in allowed:
+                        diag["volume_zone"] += 1
+                        position = 0
+                        continue
+
                 # ── VWAP MTF: Higher TF fair-value anchor ─────────────────
                 if USE_VWAP_MTF and "spread_vwap_mtf" in df.columns:
                     sv_mtf = df["spread_vwap_mtf"].iloc[i]
@@ -989,6 +1027,18 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                 # Lock in the regime-conditioned thresholds for this trade
                 active_exit_thresh = exit_thresh_live
                 active_stop_thresh = stop_thresh_live
+
+                # ── LVN-anchored stop ─────────────────────────────────────
+                # Park the stop just beyond the nearest Low-Volume Node in the
+                # adverse direction, so we are not stopped inside a churn zone.
+                # Long entered deep-negative → adverse is further down (lvn_down);
+                # short entered high-positive → adverse is further up (lvn_up).
+                if USE_LVN_STOP and USE_VOLUME_ZONES:
+                    lvn = (df["lvn_down"].iloc[i] if position == 1
+                           else df["lvn_up"].iloc[i])
+                    if np.isfinite(lvn):
+                        active_stop_thresh = float(
+                            np.clip(abs(lvn), LVN_STOP_Z_MIN, LVN_STOP_Z_MAX))
                 diag["entries"] += 1
 
     out = pd.DataFrame(trades)

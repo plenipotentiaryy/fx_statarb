@@ -39,6 +39,7 @@ PIPELINE = [
             ("h", "step3h_z_profiler.py",        "Layer 8 — Z-Bounce Density Profiler (EV-optimal entry)"),
             ("i", "step3i_profiler.py",          "Layer 9 — Z-Bounce Profiler legacy (R:R=1.3 scan)"),
             ("j", "step3j_wfo.py",               "Layer 10— Walk-Forward Optimization (Gatev 12m/6m/6m)"),
+            ("k", "step3k_volume_zones.py",      "Layer 11— Volume-Zone profiler (HVN/LVN, CME futures vol)"),
         ],
         "required": False,
     },

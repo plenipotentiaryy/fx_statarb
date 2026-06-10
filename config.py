@@ -107,6 +107,25 @@ USE_RVOL_GATE    = True
 RVOL_THRESHOLD   = 0.60    # looser gate: keep thin-market protection without starving trades
 RVOL_WINDOW      = 200     # ~3.3 hours rolling baseline for "normal" volume
 
+# ── Volume Zones (HVN/LVN profile) ───────────────────────────────────────────
+# Trade only where the spread spent the most volume (HVN — acceptance/range) OR
+# only at the thin extremes (LVN — rejection/snapback). Volume comes from CME FX
+# futures if data/futures_volumes_*.parquet exists, else Dukascopy tick volume.
+USE_VOLUME_ZONES   = False   # master switch — keep OFF until zones are profiled
+ZONE_MODE          = "HVN"   # "HVN" = fade acceptance | "LVN" = fade rejection
+VOLUME_ZONE_BINS   = 60      # histogram resolution of the Volume-at-Z profile
+VOLUME_ZONE_VA_PCT = 0.70    # value-area fraction (classic Market Profile = 70%)
+VOLUME_ZONE_HVN_Q  = 0.80    # bins above this volume-quantile are High-Volume Nodes
+VOLUME_ZONE_LVN_Q  = 0.20    # bins below this volume-quantile are Low-Volume Nodes
+VOLUME_ZONE_WINDOW = 5000    # trailing bars used to (re)build the causal profile
+VOLUME_ZONE_STEP   = 500     # rebuild the profile every N bars (speed/recency trade-off)
+
+# LVN-anchored stop: park the stop just beyond the nearest Low-Volume Node so the
+# spread is not stopped inside a churn zone. Clamped to the [min,max] Z band below.
+USE_LVN_STOP       = False   # requires USE_VOLUME_ZONES
+LVN_STOP_Z_MIN     = 2.6     # never tighter than this
+LVN_STOP_Z_MAX     = 5.0     # never wider than this
+
 # ── VWAP prices for Kalman input ─────────────────────────────────────────────
 USE_VWAP        = True
 USE_VWAP_MTF    = False    # disable hard higher-tf anchor gate; keep VWAP itself for Kalman input
